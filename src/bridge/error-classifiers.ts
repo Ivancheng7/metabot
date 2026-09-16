@@ -24,6 +24,6 @@ export function isUnknownModelError(errorMessage?: string): boolean {
 /** Extract the model name from an unknown-model error, when present. */
 export function modelFromUnknownModelError(errorMessage?: string): string | undefined {
   if (!errorMessage) return undefined;
-  const match = /model[ `"']*([A-Za-z0-9._:\/-]+)/i.exec(errorMessage);
+  const match = /model[ `"']*([A-Za-z0-9._:/-]+)/i.exec(errorMessage);
   return match?.[1];
 }
