@@ -992,3 +992,49 @@ describe('Feishu topic session isolation', () => {
     } finally { release(); bridge.destroy(); vi.unstubAllEnvs(); fs.rmSync(directory, { recursive: true, force: true }); }
   });
 });
+
+describe('Codex mid-turn steering commands', () => {
+  function controls() {
+    const sender = makeSender();
+    const notice = vi.spyOn(sender, 'sendTextNotice');
+    const config = { ...makeCodexConfig(), codex: { transport: 'app-server' as const } };
+    const bridge = new MessageBridge(config, mockLogger, sender as any) as any;
+    const start = vi.spyOn(bridge, 'startQuery').mockResolvedValue(undefined);
+    const executor = {
+      canSteer: vi.fn(() => true),
+      steer: vi.fn(async () => 'steered'),
+
+    };
+    vi.spyOn(bridge, 'executorForEngine').mockReturnValue(executor);
+    const message = (text: string) => ({ text, chatId: 'controls-chat', chatType: 'private', messageId: 'control-msg', userId: 'u' });
+    return { bridge, start, notice, executor, message };
+  }
+
+  it('routes append and steer directly to the active executor without starting or queueing a turn', async () => {
+    const ctx = controls();
+    vi.spyOn(ctx.bridge, 'isChatBusy').mockReturnValue(true);
+    await ctx.bridge.handleMessage(ctx.message('/append change direction'));
+    await ctx.bridge.handleMessage(ctx.message('/steer another detail'));
+    expect(ctx.executor.steer.mock.calls).toEqual([['controls-chat', 'change direction'], ['controls-chat', 'another detail']]);
+    expect(ctx.start).not.toHaveBeenCalled();
+    expect(ctx.bridge.messageQueues.size).toBe(0);
+    expect(ctx.notice).toHaveBeenLastCalledWith('controls-chat', '已提交插话', expect.any(String), 'green');
+  });
+
+  it('does not turn an idle append into a new task', async () => {
+    const ctx = controls();
+    await ctx.bridge.handleMessage(ctx.message('/append detail'));
+    expect(ctx.executor.steer).not.toHaveBeenCalled();
+    expect(ctx.start).not.toHaveBeenCalled();
+    expect(ctx.notice).toHaveBeenLastCalledWith('controls-chat', '当前没有可插话的任务', expect.any(String), 'orange');
+  });
+
+  it('keeps ordinary messages queued while a task is running', async () => {
+    const ctx = controls();
+    vi.spyOn(ctx.bridge, 'isChatBusy').mockReturnValue(true);
+    await ctx.bridge.handleMessage(ctx.message('ordinary follow-up'));
+    expect(ctx.executor.steer).not.toHaveBeenCalled();
+    expect(ctx.bridge.messageQueues.get('controls-chat')).toHaveLength(1);
+    expect(ctx.start).not.toHaveBeenCalled();
+  });
+});
