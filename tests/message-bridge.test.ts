@@ -1092,3 +1092,37 @@ describe('Codex manual compaction commands', () => {
     expect(ctx.bridge.sessionManager.getSession('controls-chat').sessionId).toBe(command === '/reset' ? undefined : 'existing-session');
   });
 });
+
+function claudeControls() {
+  const sender = makeSender();
+  const notice = vi.spyOn(sender, 'sendTextNotice');
+  const bridge = new MessageBridge(makeConfig(), mockLogger, sender as any) as any;
+  const start = vi.spyOn(bridge, 'startQuery').mockResolvedValue(undefined);
+  const message = (text: string) => ({ text, chatId: 'claude-controls', chatType: 'private', messageId: 'control-msg', userId: 'u' });
+  return { bridge, start, notice, message };
+}
+
+describe('Claude compaction routing', () => {
+  it('uses native compact, keeps the session and queues messages until completion', async () => {
+    const ctx = claudeControls();
+    ctx.bridge.sessionManager.setSessionId('claude-controls', 'existing-claude', 'claude');
+    let complete!: () => void;
+    const pending = new Promise<void>(resolve => { complete = resolve; });
+    const finish = vi.fn();
+    const run = vi.spyOn(ctx.bridge, 'runOneTurn').mockResolvedValue({
+      stream: (async function* () { await pending; yield { type: 'result', is_error: false }; })(), finish,
+    });
+    const drain = vi.spyOn(ctx.bridge, 'processQueue').mockImplementation(() => {});
+    const compact = ctx.bridge.handleMessage(ctx.message('/compact'));
+    await vi.waitFor(() => expect(run).toHaveBeenCalled());
+    await ctx.bridge.handleMessage(ctx.message('ordinary follow-up'));
+    expect(ctx.bridge.messageQueues.get('claude-controls')).toHaveLength(1);
+    expect(finish).not.toHaveBeenCalled();
+    expect(ctx.start).not.toHaveBeenCalled();
+    expect(run).toHaveBeenCalledWith('claude-controls', 'claude', expect.objectContaining({prompt: '/compact'}));
+    complete(); await compact;
+    expect(drain).toHaveBeenCalledWith('claude-controls');
+    expect(ctx.bridge.sessionManager.getSession('claude-controls').sessionId).toBe('existing-claude');
+    expect(ctx.notice).toHaveBeenLastCalledWith('claude-controls', '上下文压缩完成', expect.any(String), 'green');
+  });
+});

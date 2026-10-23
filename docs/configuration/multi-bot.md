@@ -195,3 +195,7 @@ CLAUDE_DEFAULT_WORKING_DIRECTORY=/home/me/project
 workspace for every engine.
 
 See [Environment Variables](environment-variables.md) for the full list.
+
+### Claude Code manual compaction
+
+The default persistent PTY backend also supports `/compact` while idle. The bridge runs the native command and waits for the manual `PostCompact` event instead of treating the generic slash-command idle timeout as success. The session is preserved. Ordinary messages queue until completion; `/stop` or `/reset` cancels. Requires Claude Code with `PostCompact` support (validated with 2.1.280). The legacy SDK backend and non-persistent execution are unsupported.
