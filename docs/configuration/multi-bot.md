@@ -97,6 +97,25 @@ The public adapter currently runs `codex exec --json` and resumes with
 `codex exec resume`. Codex app-server and native mid-turn steering are not part
 of the current public behavior.
 
+### Manual compaction
+
+Send `/compact` while a Codex conversation is idle to compact its history without
+resetting the session. The bridge temporarily starts the installed CLI's
+app-server, resumes the existing thread, and calls `thread/compact/start`.
+Normal turns continue to use `codex exec`; no transport configuration change is
+required. The bridge waits for a completed compaction item and successful turn,
+rather than treating the initial RPC acknowledgement as success.
+
+Ordinary messages sent during compaction are queued and run after compaction
+finishes; they do not cancel it. `/stop` cancels compaction and clears the queue,
+while `/reset` additionally clears the session as usual. A second `/compact`
+while busy is rejected. Failed or timed-out compaction never automatically
+resets the existing session. Compaction is limited to five minutes.
+
+Use a Codex CLI supporting
+[app-server thread/compact/start](https://developers.openai.com/codex/app-server/).
+An existing session is required; attachments and additional arguments are not accepted.
+
 ## Kimi Code Options {#kimi-code-options}
 
 ```json

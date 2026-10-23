@@ -70,6 +70,7 @@ export class CommandHandler {
           '**Bot Commands:**',
           '`/reset` - Clear session, start fresh',
           '`/stop` - Abort current running task',
+          '`/compact` - Compact the current Codex session while idle; messages during compaction queue',
           '`/status` - Show current session info',
           '`/model` - Show current engine/model; `/model list` - Available options',
           '`/model claude`, `/model kimi`, or `/model codex` - Switch engine (resets session)',

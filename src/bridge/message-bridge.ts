@@ -10,6 +10,7 @@ import type {
   Engine,
   Executor,
   ExecutionHandle,
+  SDKMessage,
   EngineName,
   TeamEvent,
   ApiContext,
@@ -1654,6 +1655,64 @@ export class MessageBridge {
     await this.handleAnswer(syntheticMsg, task);
   }
 
+  private async tryHandleCodexCompaction(msg: IncomingMessage): Promise<boolean> {
+    if (!/^\/compact(?:\s|$)/i.test(msg.text.trim())) return false;
+    const { chatId } = msg;
+    const argument = msg.text.trim().slice('/compact'.length).trim();
+    const notice = (title: string, body: string, color: 'blue' | 'orange' | 'green' | 'red' = 'orange') =>
+      this.sender.sendTextNotice(chatId, title, body, color);
+    if (msg.imageKey || msg.fileKey || msg.extraMedia?.length) {
+      await notice('请使用纯文本命令', '直接发送 /compact，不要附加图片或文件。');
+      return true;
+    }
+    const executor = this.executorForEngine(chatId, 'codex');
+    if (argument) {
+      await notice('压缩用法', '直接发送 /compact，目前不接受额外参数。');
+      return true;
+    }
+    const session = this.sessionManager.getSession(chatId);
+    if (!session.sessionId) {
+      await notice('暂无可压缩的会话', '先与 Codex 对话，再发送 /compact。');
+      return true;
+    }
+    const task = this.reserveTaskStart(chatId, '/compact', 'chat', true);
+    if (!task) {
+      await notice('任务正在运行', '请等待当前任务完成后再发送 /compact。');
+      return true;
+    }
+    let handle: ExecutionHandle | undefined;
+    const timer = setTimeout(() => task.abortController.abort(), 5 * 60_000);
+    try {
+      await notice('正在压缩上下文', '保留当前会话 ID，压缩完成后可继续对话。可用 /stop 取消。', 'blue');
+      if (task.abortController.signal.aborted) return true;
+      handle = executor.compact!({
+        prompt: '', cwd: session.workingDirectory, sessionId: session.sessionId,
+        model: session.model, reasoningEffort: session.reasoningEffort,
+        abortController: task.abortController, apiContext: { botName: this.config.name, chatId },
+      });
+      let result: SDKMessage | undefined;
+      for await (const message of handle.stream) {
+        if (message.type === 'result') result = message;
+      }
+      if (task.abortController.signal.aborted) {
+        await notice('压缩已取消', '本次压缩未确认完成。');
+      } else if (!result || result.is_error) {
+        await notice('压缩失败', result?.errors?.join('\n') || 'Codex 未确认压缩完成，会话未重置。', 'red');
+      } else {
+        await notice('上下文压缩完成', '当前会话 ID 保持不变，可以继续对话。', 'green');
+      }
+    } catch (err) {
+      this.logger.warn({ err, chatId }, 'Codex compaction failed');
+      await notice('压缩失败', '会话未重置。请稍后重试，或查看运行日志。', 'red');
+    } finally {
+      clearTimeout(timer);
+      handle?.finish();
+      this.releaseTaskStart(chatId, task);
+      if (!this.isChatBusy(chatId)) this.processQueue(chatId);
+    }
+    return true;
+  }
+
   async handleMessage(msg: IncomingMessage): Promise<void> {
     return withReplyContext(msg, () => this.handleMessageInContext(msg));
   }
@@ -1687,6 +1746,7 @@ export class MessageBridge {
       if (await this.slashPickers.tryOpen(msg)) return;
 
       const activeEngine = this.sessionManager.getSession(chatId).engine ?? resolveEngineName(this.config);
+      if (activeEngine === 'codex' && await this.tryHandleCodexCompaction(msg)) return;
       if (activeEngine === 'codex' && await this.codexCommands.tryHandleBridgeCommand(msg)) return;
 
       const handled = await this.commandHandler.handle(msg);
@@ -3306,6 +3366,7 @@ export class MessageBridge {
     this.pendingBetweenTurnQuestions.clear();
     this.recentQuestionCard.clear();
     this.exitPlanCardsShown.clear();
+    for (const task of this.startingTasks.values()) task.abortController.abort();
     this.startingTasks.clear();
     this.messageQueues.clear();
     this.sessionManager.destroy();
