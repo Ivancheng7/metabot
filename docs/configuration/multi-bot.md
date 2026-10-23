@@ -192,3 +192,7 @@ CLAUDE_DEFAULT_WORKING_DIRECTORY=/home/me/project
 workspace for every engine.
 
 See [Environment Variables](environment-variables.md) for the full list.
+
+### Claude Code steering
+
+The default persistent PTY backend also supports `/append text` and `/steer text`. Input goes to the running Claude Code composer without interrupting the task; Claude consumes it at an available tool boundary. Ordinary messages remain queued. Permission menus, questions, or an unavailable composer reject steering. The legacy SDK backend and non-persistent execution are unsupported.

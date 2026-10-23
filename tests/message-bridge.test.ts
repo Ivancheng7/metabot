@@ -1038,3 +1038,33 @@ describe('Codex mid-turn steering commands', () => {
     expect(ctx.start).not.toHaveBeenCalled();
   });
 });
+
+function claudeControls() {
+  const sender = makeSender();
+  const notice = vi.spyOn(sender, 'sendTextNotice');
+  const bridge = new MessageBridge(makeConfig(), mockLogger, sender as any) as any;
+  const start = vi.spyOn(bridge, 'startQuery').mockResolvedValue(undefined);
+  const message = (text: string) => ({ text, chatId: 'claude-controls', chatType: 'private', messageId: 'control-msg', userId: 'u' });
+  return { bridge, start, notice, message };
+}
+
+describe('Claude steering routing', () => {
+  it('submits to the persistent PTY without starting another query', async () => {
+    const ctx = claudeControls();
+    const steer = vi.fn(async () => 'steered');
+    ctx.bridge.persistentRegistry = { peek: () => ({ canSteer: () => true, steer }) };
+    vi.spyOn(ctx.bridge, 'isChatBusy').mockReturnValue(true);
+    await ctx.bridge.handleMessage(ctx.message('/append new direction'));
+    expect(steer).toHaveBeenCalledWith('new direction');
+    expect(ctx.start).not.toHaveBeenCalled();
+    expect(ctx.bridge.messageQueues.size).toBe(0);
+    expect(ctx.notice).toHaveBeenLastCalledWith('claude-controls', '已提交插话', expect.any(String), 'green');
+  });
+  it('reports unsupported SDK backend without claiming acceptance', async () => {
+    const ctx = claudeControls();
+    ctx.bridge.config.claude.backend = 'sdk';
+    await ctx.bridge.handleMessage(ctx.message('/append new direction'));
+    expect(ctx.notice).toHaveBeenLastCalledWith('claude-controls', 'Claude Code 功能未启用', expect.any(String), 'orange');
+    expect(ctx.start).not.toHaveBeenCalled();
+  });
+});

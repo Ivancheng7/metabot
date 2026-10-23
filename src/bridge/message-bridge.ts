@@ -1654,14 +1654,14 @@ export class MessageBridge {
     await this.handleAnswer(syntheticMsg, task);
   }
 
-  private async tryHandleCodexSteering(msg: IncomingMessage): Promise<boolean> {
+  private async tryHandleSessionSteering(msg: IncomingMessage, engineName: 'claude' | 'codex' = 'codex'): Promise<boolean> {
     const match = msg.text.trim().match(/^\/(append|steer)(?:\s+([\s\S]*))?$/i);
     if (!match) return false;
     const { chatId } = msg;
     const argument = match[2]?.trim() ?? '';
     const notice = (title: string, body: string, color: 'blue' | 'orange' | 'green' | 'red' = 'orange') =>
       this.sender.sendTextNotice(chatId, title, body, color);
-    if (this.config.codex?.transport !== 'app-server') {
+    if (engineName === 'codex' && this.config.codex?.transport !== 'app-server') {
       await notice('Codex 功能未启用', '当前机器人使用 exec 模式。需要启用 codex.transport = app-server 才能插话。');
       return true;
     }
@@ -1669,22 +1669,29 @@ export class MessageBridge {
       await notice('请使用纯文本命令', '/append 目前只支持文字；图片和文件请作为普通消息发送。');
       return true;
     }
-    const executor = this.executorForEngine(chatId, 'codex');
+    if (engineName === 'claude' && (!this.isPersistentExecutorEnabled() || this.config.claude.backend === 'sdk')) {
+      await notice('Claude Code 功能未启用', '压缩和插话需要默认的持久 PTY 后端。');
+      return true;
+    }
+    const executor = this.executorForEngine(chatId, engineName);
+    const claude = engineName === 'claude' ? this.persistentRegistry?.peek(chatId) : undefined;
+    const canSteer = () => engineName === 'claude' ? claude?.canSteer() : executor.canSteer?.(chatId);
+    const steer = (text: string) => engineName === 'claude' ? claude!.steer(text) : executor.steer!(chatId, text);
     if (!argument) {
-      await notice('插话用法', '在 Codex 正在工作时发送 /append 补充指示（/steer 同义）。普通消息仍会排队。');
-    } else if (!this.isChatBusy(chatId) || !executor.canSteer?.(chatId)) {
-      await notice('当前没有可插话的任务', '任务可能尚未开始或已经结束。请稍后重试；没有运行任务时直接发送普通消息。');
+      await notice('插话用法', '在机器人正在工作时发送 /append 补充指示（/steer 同义）。普通消息仍会排队。');
+    } else if (!this.isChatBusy(chatId) || !canSteer()) {
+      await notice('当前没有可插话的任务', '任务可能尚未开始、已经结束或正在压缩。请稍后重试；没有运行任务时直接发送普通消息。');
     } else {
       try {
-        const result = await executor.steer!(chatId, argument);
+        const result = await steer(argument);
         await notice(
           result === 'steered' ? '已提交插话' : '任务已结束',
-          result === 'steered' ? '补充指示已交给当前任务，Codex 会在可处理的执行节点读取。' : '这条补充没有加入任务，请作为普通消息重新发送。',
+          result === 'steered' ? '补充指示已交给当前任务，机器人会在可处理的执行节点读取。' : '这条补充没有加入任务，请作为普通消息重新发送。',
           result === 'steered' ? 'green' : 'orange',
         );
       } catch (err) {
-        this.logger.warn({ err, chatId }, 'Codex steering request failed');
-        await notice('插话未确认', 'Codex 未确认接收这条补充。请检查当前任务的回复，再决定是否重发。', 'red');
+        this.logger.warn({ err, chatId }, 'Session steering request failed');
+        await notice('插话未确认', '未确认接收这条补充。请检查当前任务的回复，再决定是否重发。', 'red');
       }
     }
     return true;
@@ -1723,7 +1730,7 @@ export class MessageBridge {
       if (await this.slashPickers.tryOpen(msg)) return;
 
       const activeEngine = this.sessionManager.getSession(chatId).engine ?? resolveEngineName(this.config);
-      if (activeEngine === 'codex' && await this.tryHandleCodexSteering(msg)) return;
+      if ((activeEngine === 'codex' || activeEngine === 'claude') && await this.tryHandleSessionSteering(msg, activeEngine)) return;
       if (activeEngine === 'codex' && await this.codexCommands.tryHandleBridgeCommand(msg)) return;
 
       const handled = await this.commandHandler.handle(msg);

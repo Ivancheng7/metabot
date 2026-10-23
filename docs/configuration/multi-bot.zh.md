@@ -184,3 +184,7 @@ CLAUDE_DEFAULT_WORKING_DIRECTORY=/home/me/project
 `CLAUDE_DEFAULT_WORKING_DIRECTORY` 保留了历史名称，但会为所有引擎提供工作区。
 
 完整列表见[环境变量](environment-variables.md)。
+
+### Claude Code 插话
+
+默认的持久 PTY 后端同样支持 `/append 内容` 和 `/steer 内容`。消息送入运行中的 Claude Code 输入框，不中断当前任务；Claude 会在可处理输入的工具执行边界读取。普通消息仍排队。权限选择、问答或输入框暂不可用时会提示未接收。旧 SDK 后端或关闭持久执行器时不支持。
