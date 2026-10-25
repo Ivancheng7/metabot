@@ -71,6 +71,7 @@ export class CommandHandler {
           '**Bot Commands:**',
           '`/reset` or `/new` - Clear session, start fresh',
           '`/stop` - Abort current running task',
+          '`/compact` - Compact the current session while idle (Codex / Claude Code PTY); messages queue',
           '`/append <text>` or `/steer <text>` - Steer the active task (Codex app-server / Claude Code PTY)',
           '`/status` - Show current session info',
           '`/model` - Show current engine/model; `/model list` - Available options',

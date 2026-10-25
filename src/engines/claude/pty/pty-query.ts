@@ -183,6 +183,7 @@ export const ptyQuery = (args: {
   // terminal `result` is emitted (Stop hook). The exit watchdog uses it to
   // decide whether an unexpected claude death orphaned an in-flight turn.
   let turnInFlight = false;
+  let compactInFlight = false;
   // Bumped whenever a turn starts, ends or is interrupted. A steer captures it
   // up front and may only submit/acknowledge while it is unchanged, so text
   // pasted into the composer of an ending turn never becomes a fresh turn.
@@ -230,7 +231,7 @@ export const ptyQuery = (args: {
 
     // Stop-hook → synthesize a terminal `result` after a short drain delay.
     hookBridge.onTurnComplete(() => {
-      if (disposed) return;
+      if (disposed || compactInFlight) return;
       // Mark the turn complete IMMEDIATELY (not in the drain timeout below) so
       // the slash-command idle watchdog stands down and never double-emits.
       endTurn();
@@ -246,6 +247,14 @@ export const ptyQuery = (args: {
             usage: { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens },
           }),
         );
+      }, RESULT_DRAIN_MS);
+    });
+
+    hookBridge.onCompactComplete?.(() => {
+      if (disposed || !compactInFlight || !turnInFlight) return;
+      endTurn();
+      setTimeout(() => {
+        if (!disposed) out.enqueue(synthesizeResult({ sessionId, resultText: '上下文压缩完成，会话 ID 保持不变。' }));
       }, RESULT_DRAIN_MS);
     });
 
@@ -491,6 +500,7 @@ export const ptyQuery = (args: {
         const release = await claimComposer(true);
         if (!release || disposed) break;
         turnInFlight = true; // a new turn starts the moment we submit the prompt
+        compactInFlight = /^\/compact(?:\s|$)/i.test(text.trim());
         turnGeneration++;
         try { await session.typePrompt(text); }
         finally { release(); }
@@ -501,7 +511,7 @@ export const ptyQuery = (args: {
         // synthesize a `result` ourselves. Custom-skill slash commands that DO
         // invoke the model show the "esc to interrupt" affordance → the watchdog
         // stands down and the normal Stop-hook path completes the turn.
-        if (text.trim().startsWith('/')) void watchSlashCommandCompletion();
+        if (!compactInFlight && !/^\/compact(?:\s|$)/i.test(text.trim()) && text.trim().startsWith('/')) void watchSlashCommandCompletion();
       }
     } catch (err) {
       logger.warn({ err }, 'ptyQuery: prompt loop ended with error');
@@ -554,6 +564,7 @@ export const ptyQuery = (args: {
   /** Mark the in-flight turn finished and invalidate any pending steer. */
   function endTurn(): void {
     turnInFlight = false;
+    compactInFlight = false;
     turnGeneration++;
   }
 
@@ -655,13 +666,13 @@ export const ptyQuery = (args: {
   // ── The drop-in PtyQuery ─────────────────────────────────────────────────
   const query: PtyQuery = {
     [Symbol.asyncIterator]: () => out[Symbol.asyncIterator](),
-    canSteer: () => turnInFlight && !composerOwner && interrupts === 0 && !disposed && !!session?.steerPrompt,
+    canSteer: () => turnInFlight && !compactInFlight && !composerOwner && interrupts === 0 && !disposed && !!session?.steerPrompt,
     async steer(text) {
       if (!query.canSteer?.() || !session?.steerPrompt) return 'no-active-turn';
       const release = await claimComposer(false);
       if (!release) return 'no-active-turn';
       const generation = turnGeneration;
-      const owned = () => turnInFlight && turnGeneration === generation && interrupts === 0 && !disposed;
+      const owned = () => turnInFlight && !compactInFlight && turnGeneration === generation && interrupts === 0 && !disposed;
       try {
         if (!owned()) return 'no-active-turn';
         const submitted = await session.steerPrompt(text, owned);
