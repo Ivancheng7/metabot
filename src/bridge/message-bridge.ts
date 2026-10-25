@@ -34,6 +34,7 @@ import type { RestartTaskSnapshot } from './restart-coordinator.js';
 import { MemoryClient } from '../memory/memory-client.js';
 import { AuditLogger } from '../utils/audit-logger.js';
 import { CommandHandler } from './command-handler.js';
+import { ShadowMode } from './shadow-mode.js';
 import { OutputHandler } from './output-handler.js';
 import { CostTracker } from '../utils/cost-tracker.js';
 import { metrics } from '../utils/metrics.js';
@@ -62,6 +63,11 @@ import { buildAgentTeamPromptContextForChat } from '../agent-teams/prompt-contex
 export { isContextOverflowError, isStaleSessionError } from './error-classifiers.js';
 export { normalizePromptForEngine } from './prompt-normalizer.js';
 export { extractSpontaneousSnippet, formatSpontaneousCardBody } from './spontaneous-activity.js';
+
+export function isSyntheticActivityChatId(chatId: string): boolean {
+  return chatId.startsWith('bus:') || chatId.startsWith('core-') || chatId.startsWith('team:')
+    || /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(chatId);
+}
 
 const TASK_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
 const QUESTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes for user to answer
@@ -184,6 +190,8 @@ export interface ActivityEventData {
 }
 
 export class MessageBridge {
+  private readonly shadowMode: ShadowMode;
+  private shadowTargetOpenId?: string;
   private engine: Engine;
   private executor: Executor;
   /** Lazy per-engine cache so a session override doesn't pay instantiation cost each turn. */
@@ -299,6 +307,25 @@ export class MessageBridge {
 
     const memoryClient = new MemoryClient(logger);
 
+    this.shadowMode = new ShadowMode({
+      generate: async (chatId, prompt) => {
+        const shadowChatId = `shadow:${chatId}`;
+        this.sessionManager.resetSession(shadowChatId);
+        const session = this.sessionManager.getSession(chatId);
+        const engine = session.engine ?? defaultEngineName;
+        const result = await this.executeApiTask({
+          chatId: shadowChatId, userId: 'shadow', prompt, sendCards: false, allowedTools: [],
+          engine, model: session.modelEngine === engine ? session.model : undefined,
+        });
+        return result.success ? result.responseText.trim() : undefined;
+      },
+      deliver: (chatId, text, idempotencyKey) => this.sender.sendTextAsUser!(chatId, text, idempotencyKey),
+      notice: (chatId, title, content, color) => this.sender.sendTextNotice(chatId, title, content, color),
+      logger,
+      profilePath: path.join(config.claude.defaultWorkingDirectory, '.metabot', 'shadow-profile.md'),
+      targetMention: () => this.shadowTargetOpenId ? `<at user_id="${this.shadowTargetOpenId}">${config.name}</at> ` : '',
+    });
+
     this.commandHandler = new CommandHandler(
       config, logger, sender, this.sessionManager, memoryClient, this.audit,
       (chatId) => this.startingTasks.get(chatId) ?? this.runningTasks.get(chatId),
@@ -307,6 +334,18 @@ export class MessageBridge {
       (chatId, reason) => this.releaseChatExecutor(chatId, reason),
       (chatId) => this.listSessionsForChat(chatId),
       (chatId, sessionId) => this.applyResume(chatId, sessionId),
+      async (msg, args) => {
+        const allowedUsers = (process.env.METABOT_AUTO_ALLOWED_USER_IDS || '').split(',').map(value => value.trim()).filter(Boolean);
+        if (!allowedUsers.includes(msg.userId)) {
+          await this.sender.sendTextNotice(msg.chatId, 'Shadow Mode unavailable', 'The deployment owner must explicitly allow your user ID in METABOT_AUTO_ALLOWED_USER_IDS before user-identity automation can run.', 'orange');
+          return;
+        }
+        if (!this.sender.sendTextAsUser || !this.shadowTargetOpenId) {
+          await this.sender.sendTextNotice(msg.chatId, 'Shadow Mode unavailable', 'This channel requires a Feishu/Lark bot identity and a user-authorized Lark client.', 'orange');
+          return;
+        }
+        await this.shadowMode.command(msg, args);
+      },
     );
 
     this.outputHandler = new OutputHandler(logger, sender, this.outputsManager);
@@ -449,6 +488,10 @@ export class MessageBridge {
     };
   }
 
+  setShadowTargetOpenId(openId: string | undefined): void {
+    this.shadowTargetOpenId = openId;
+  }
+
   /** Inject the doc sync service for /sync commands. */
   setDocSync(docSync: DocSync): void {
     this.commandHandler.setDocSync(docSync);
@@ -482,6 +525,23 @@ export class MessageBridge {
 
   isBusy(chatId: string): boolean {
     return this.isChatBusy(chatId);
+  }
+
+  async steerAgentNotification(chatId: string, text: string): Promise<boolean> {
+    if (!this.isChatBusy(chatId)) return false;
+    const engineName = this.sessionManager.getSession(chatId).engine ?? resolveEngineName(this.config);
+    const executor = engineName === 'claude' && this.isPersistentExecutorEnabled()
+      ? this.persistentRegistry?.peek(chatId)
+      : undefined;
+    try {
+      if (executor?.canSteer()) return await executor.steer(text) === 'steered';
+      if (engineName === 'claude') return false;
+      const native = this.executorForEngine(chatId, engineName);
+      return !!native.canSteer?.(chatId) && await native.steer?.(chatId, text) === 'steered';
+    } catch (err) {
+      this.logger.warn({ err, chatId }, 'Agent Bus notification steering failed');
+      return false;
+    }
   }
 
   private isChatBusy(chatId: string): boolean {
@@ -1456,6 +1516,7 @@ export class MessageBridge {
       apiContext?: ApiContext;
       model?: string;
       reasoningEffort?: import('../config.js').CodexReasoningEffort;
+      serviceTier?: 'fast' | 'flex' | 'default';
       onTeamEvent?: (event: TeamEvent) => void;
       maxTurns?: number;
       allowedTools?: string[];
@@ -1503,6 +1564,7 @@ export class MessageBridge {
       apiContext: opts.apiContext,
       model: opts.model,
       reasoningEffort: engineName === 'codex' ? opts.reasoningEffort ?? session.reasoningEffort : undefined,
+      serviceTier: engineName === 'codex' ? opts.serviceTier ?? session.serviceTier : undefined,
       onTeamEvent: opts.onTeamEvent,
       maxTurns: opts.maxTurns,
       allowedTools: opts.allowedTools,
@@ -1800,12 +1862,14 @@ export class MessageBridge {
     // an exact bare "reset" as /reset so it can abort a running PTY turn and
     // clear the session instead of being queued behind the old task.
     if (text.trim().toLowerCase() === 'reset') {
+      this.shadowMode.stop(chatId);
       await this.commandHandler.handle({ ...msg, text: '/reset' });
       return;
     }
 
     // Handle commands (always allowed, even during pending questions)
     if (text.startsWith('/')) {
+      if (/^\/(?:reset|new)(?:\s|$)/i.test(text)) this.shadowMode.stop(chatId);
       // Bare client-side slash commands (no argument) that we surface as a
       // selectable Feishu picker card instead of passing the argless command
       // through to the TUI (which would just open an autocomplete menu).
@@ -1836,6 +1900,8 @@ export class MessageBridge {
       await this.startQuery(msg);
       return;
     }
+
+    this.shadowMode.observeInbound(msg);
 
     // Between-turn AskUserQuestion reply — must run BEFORE the
     // running-task / queue branches below, because no `runningTasks` entry
@@ -2338,6 +2404,7 @@ export class MessageBridge {
       transportChatId: this.sender.getTransportChatId?.(chatId),
       engine: engineName,
       sessionId: this.sessionManager.getSession(chatId).sessionId,
+      busSessionId: isSyntheticActivityChatId(chatId) ? undefined : this.sessionRegistry?.findByChatId(chatId)?.id,
       teamContext: this.agentTeamStore
         ? buildAgentTeamPromptContextForChat(this.agentTeamStore, chatId)
         : undefined,
@@ -2737,6 +2804,9 @@ export class MessageBridge {
 
       // Record in cross-platform session registry
       this.recordSession(chatId, displayPrompt, lastState.responseText, processor.getSessionId(), lastState.costUsd, durationMs);
+      if (lastState.status === 'complete') void this.shadowMode.observeFinal(chatId, text, lastState.responseText).catch(err => {
+        this.logger.warn({ err, chatId }, 'Shadow Mode final-turn observation failed');
+      });
 
       // Send completion notification for long-running tasks (>10s) so user gets a Feishu push
       await sendCompletionNotice({
@@ -2808,6 +2878,9 @@ export class MessageBridge {
           metrics.incCounter('metabot_tasks_by_status', lastState.status === 'complete' ? 'success' : 'error');
 
           this.recordSession(chatId, displayPrompt, lastState.responseText, processor.getSessionId(), lastState.costUsd, durationMs);
+          if (lastState.status === 'complete') void this.shadowMode.observeFinal(chatId, text, lastState.responseText).catch(err => {
+            this.logger.warn({ err, chatId }, 'Shadow Mode retry observation failed');
+          });
           await sendCompletionNotice({
             sender: this.sender,
             config: this.config,
@@ -2917,7 +2990,8 @@ export class MessageBridge {
     options: ApiTaskOptions,
     startingTask: StartingTask,
   ): Promise<ApiTaskResult> {
-    const { prompt: originalPrompt, chatId, userId = 'api', sendCards = false } = options;
+    const { prompt: originalPrompt, chatId, userId = 'api' } = options;
+    const sendCards = options.sendCards === true && !isSyntheticActivityChatId(chatId);
 
     const { session, engineName } = this.prepareSessionForApiExecution(chatId, options.engine);
     const prompt = await this.prepareTopicPrompt(chatId, originalPrompt);
@@ -2958,6 +3032,7 @@ export class MessageBridge {
       transportChatId: this.sender.getTransportChatId?.(chatId),
       engine: engineName,
       sessionId: this.sessionManager.getSession(chatId).sessionId,
+      busSessionId: isSyntheticActivityChatId(chatId) ? undefined : this.sessionRegistry?.findByChatId(chatId)?.id,
       teamContext: this.agentTeamStore
         ? buildAgentTeamPromptContextForChat(this.agentTeamStore, chatId)
         : undefined,
@@ -3393,6 +3468,7 @@ export class MessageBridge {
    * this so the cleanup body lives in one place.
    */
   private teardownSync(): Promise<void> {
+    this.shadowMode.destroy();
     for (const [, batch] of this.pendingBatches) {
       clearTimeout(batch.timerId);
     }

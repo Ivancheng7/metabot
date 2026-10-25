@@ -114,7 +114,8 @@ export function resolveCodexModelMetadata(codexConfig: CodexBotConfig, requested
     || codexConfig.model
     || codexConfig.displayModel
     || readCodexConfigModel(codexConfig.profile)
-    || readDefaultModelFromCache();
+    || readDefaultModelFromCache()
+    || 'gpt-6.1-sol';
   return {
     model,
     contextWindow: codexConfig.contextWindow ?? readContextWindowFromCache(model) ?? (model ? FALLBACK_CODEX_CONTEXT_WINDOW : undefined),
@@ -327,6 +328,7 @@ export function buildCodexArgs(
   sessionId: string | undefined,
   model: string | undefined,
   reasoningEffort?: CodexReasoningEffort,
+  serviceTier?: 'fast' | 'flex' | 'default',
 ): string[] {
   const args: string[] = [];
 
@@ -343,6 +345,8 @@ export function buildCodexArgs(
   if (codexConfig.baseUrl) args.push('-c', `openai_base_url=${tomlString(codexConfig.baseUrl)}`);
   const effectiveEffort = reasoningEffort ?? codexConfig.reasoningEffort;
   if (effectiveEffort) args.push('-c', `model_reasoning_effort=${tomlString(effectiveEffort)}`);
+  const tier = serviceTier ?? codexConfig.serviceTier;
+  if (tier) args.push('-c', `service_tier=${tomlString(tier)}`);
   for (const extraArg of codexConfig.extraArgs ?? []) args.push(extraArg);
 
   args.push('exec');
@@ -368,7 +372,7 @@ export class CodexExecutor {
   private startAppServer(options: ExecutorOptions): ExecutionHandle {
     const config = this.config.codex ?? {};
     const metadata = resolveCodexModelMetadata(config, options.model);
-    const args = buildCodexArgs(config, options.cwd, '', undefined, options.model ?? config.model, options.reasoningEffort);
+    const args = buildCodexArgs(config, options.cwd, '', undefined, options.model ?? config.model, options.reasoningEffort, options.serviceTier);
     const command = buildCodexSpawnCommand(resolveCodexPath(config.executable), [
       ...args.slice(0, args.indexOf('exec')), 'app-server', '--listen', 'stdio://',
     ]);
@@ -377,6 +381,7 @@ export class CodexExecutor {
       cwd: options.cwd, prompt: this.buildPromptWithContext(options.prompt, options.outputsDir, options.apiContext),
       sessionId: options.sessionId, model: metadata.model, contextWindow: metadata.contextWindow,
       effort: options.reasoningEffort ?? config.reasoningEffort,
+      serviceTier: options.serviceTier ?? config.serviceTier,
       approvalPolicy: config.dangerouslyBypassApprovalsAndSandbox ? 'never' : config.approvalPolicy ?? 'never',
       sandbox: config.dangerouslyBypassApprovalsAndSandbox ? 'danger-full-access' : config.sandbox ?? 'workspace-write',
       signal: options.abortController.signal, logger: this.logger,
@@ -424,7 +429,7 @@ export class CodexExecutor {
       model: modelMetadata.model,
       contextWindow: modelMetadata.contextWindow,
     });
-    const args = buildCodexArgs(codexConfig, cwd, fullPrompt, sessionId, model, options.reasoningEffort);
+    const args = buildCodexArgs(codexConfig, cwd, fullPrompt, sessionId, model ?? modelMetadata.model, options.reasoningEffort, options.serviceTier);
     const startTime = Date.now();
     let child: ChildProcess | undefined;
     let sawResult = false;

@@ -1,4 +1,4 @@
-import type { BotConfigBase, CodexReasoningEffort } from '../config.js';
+import { normalizeCodexReasoningEffort, type BotConfigBase, type CodexReasoningEffort } from '../config.js';
 import type { Logger } from '../utils/logger.js';
 import type { IncomingMessage } from '../types.js';
 import type { IMessageSender } from './message-sender.interface.js';
@@ -47,6 +47,7 @@ export class CommandHandler {
      * resumes via `claude --resume`. Backs both `/resume` forms.
      */
     private applyResume: (chatId: string, sessionId: string) => Promise<void>,
+    private handleAuto?: (msg: IncomingMessage, args: string) => Promise<void>,
   ) {}
 
   /** Set the doc sync service (optional, only available for Feishu bots). */
@@ -69,7 +70,7 @@ export class CommandHandler {
       case '/help':
         await this.sender.sendTextNotice(chatId, '📖 Help', [
           '**Bot Commands:**',
-          '`/reset` or `/new` - Clear session, start fresh',
+          '`/reset` or `/new` - Clear session and /goal, start fresh (working directory preserved)',
           '`/stop` - Abort current running task',
           '`/compact` - Compact the current session while idle (Codex / Claude Code PTY); messages queue',
           '`/append <text>` or `/steer <text>` - Steer the active task (Codex app-server / Claude Code PTY)',
@@ -82,6 +83,7 @@ export class CommandHandler {
           '`/resume <id>` - Resume a session directly by id prefix',
           '`/memory` - Memory document commands',
           '`@Bot /group-reply mention|all|status` - Feishu group reply mode (scoped to this Agent and group)',
+          '`/auto [goal]` - Let Shadow Mode send the next user message toward an optional goal (it stops itself when the goal is reached); your messages are inserted without stopping it; `/auto stop` stops it',
           '`/help` or `/?` - Show this help message',
           '',
           '**Agent Commands:**',
@@ -106,7 +108,7 @@ export class CommandHandler {
         return true;
 
       case '/new':
-      case '/reset':
+      case '/reset': {
         {
           const task = this.getActiveTask(chatId);
           const cleared = this.clearQueue(chatId);
@@ -130,6 +132,7 @@ export class CommandHandler {
             });
           }
         }
+        const hadGoal = !!this.sessionManager.getSession(chatId).activeGoal;
         this.sessionManager.resetSession(chatId);
         // Tear down the persistent Claude process for this chat (Stage 3b).
         // Otherwise the old long-lived executor would keep running with its
@@ -140,8 +143,16 @@ export class CommandHandler {
         } catch (err) {
           this.logger.warn({ err, chatId }, 'Failed to release persistent executor on /reset');
         }
-        await this.sender.sendTextNotice(chatId, '✅ Session Reset', 'Conversation cleared. Working directory preserved.', 'green');
+        await this.sender.sendTextNotice(
+          chatId,
+          '✅ Session Reset',
+          hadGoal
+            ? 'Conversation cleared. Working directory preserved; active /goal cleared.'
+            : 'Conversation cleared. Working directory preserved.',
+          'green',
+        );
         return true;
+      }
 
       case '/stop': {
         const task = this.getActiveTask(chatId);
@@ -187,6 +198,15 @@ export class CommandHandler {
           `**Effort:** \`${session.reasoningEffort || this.config.codex?.reasoningEffort || 'codex default'}\`${session.reasoningEffort ? ' (session override)' : ''}`,
           `**Running:** ${isRunning ? 'Yes ⏳' : 'No'}`,
         ].join('\n'));
+        return true;
+      }
+
+      case '/auto': {
+        if (!this.handleAuto) {
+          await this.sender.sendTextNotice(chatId, 'Shadow Mode', 'Shadow Mode is unavailable on this channel.', 'red');
+          return true;
+        }
+        await this.handleAuto(msg, text.slice('/auto'.length).trim());
         return true;
       }
 
@@ -342,8 +362,6 @@ export class CommandHandler {
     const botEngine = resolveEngineName(this.config);
     const activeEngine = session.engine ?? botEngine;
     const botDefault = this.defaultModelForEngine(activeEngine);
-
-    // No args — show current model
     if (!args) {
       const active = session.model || botDefault || '_default_';
       const exampleModels = this.exampleModelsForEngine(activeEngine);
@@ -363,7 +381,6 @@ export class CommandHandler {
     }
 
     const normalized = args.toLowerCase();
-
     if (normalized !== 'list' && normalized !== 'ls' && this.getActiveTask(chatId)) {
       await this.sender.sendTextNotice(
         chatId,
@@ -373,8 +390,27 @@ export class CommandHandler {
       );
       return;
     }
-
-    // Engine switch — /model claude, /model kimi, or /model codex
+    if (activeEngine === 'codex' && normalized === 'fast') {
+      this.sessionManager.setServiceTier(chatId, 'fast');
+      await this.sender.sendTextNotice(
+        chatId,
+        '✅ Fast',
+        '当前模型保持不变，下一轮启用 Fast。关闭：`/model <model>|<effort>|default`。',
+        'green',
+      );
+      return;
+    }
+    if (activeEngine === 'kimi' && normalized === 'fast') {
+      const fastModel = kimiFastModelId(session.model || botDefault);
+      this.sessionManager.setSessionModel(chatId, fastModel, activeEngine);
+      await this.sender.sendTextNotice(
+        chatId,
+        '✅ Fast',
+        `Session model set to \`${fastModel}\`（高速版，下一轮生效）。关闭：\`/model <model>\` 或 \`/model reset\`。`,
+        'green',
+      );
+      return;
+    }
     if (isEngineName(normalized)) {
       if (activeEngine === normalized) {
         await this.sender.sendTextNotice(
@@ -386,6 +422,11 @@ export class CommandHandler {
         return;
       }
       this.sessionManager.setSessionEngine(chatId, normalized);
+      try {
+        await this.releaseExecutor(chatId, 'engine-switch');
+      } catch (err) {
+        this.logger.warn({ err, chatId }, 'Failed to release executor on engine switch');
+      }
       await this.sender.sendTextNotice(
         chatId,
         `✅ Engine switched to ${normalized}`,
@@ -399,13 +440,19 @@ export class CommandHandler {
       );
       return;
     }
-
-    // List available models
     if (normalized === 'list' || normalized === 'ls') {
       const active = session.model || botDefault;
       const claudeModels = [
-        { id: 'claude-fable-5', label: 'Fable 5', note: 'Latest Claude Code model · 1M context · 128k max output · adaptive thinking' },
-        { id: 'claude-opus-4-8', label: 'Opus 4.8', note: 'High-capability legacy default · 200k context · 128k max output' },
+        {
+          id: 'claude-fable-5',
+          label: 'Fable 5',
+          note: 'Latest Claude Code model · 1M context · 128k max output · adaptive thinking',
+        },
+        {
+          id: 'claude-opus-4-8',
+          label: 'Opus 4.8',
+          note: 'High-capability legacy default · 200k context · 128k max output',
+        },
         { id: 'claude-opus-4-8[1m]', label: 'Opus 4.8 (1M)', note: '1M context window' },
         { id: 'claude-opus-4-7', label: 'Opus 4.7', note: '200k context' },
         { id: 'claude-opus-4-7[1m]', label: 'Opus 4.7 (1M)', note: '1M context window' },
@@ -416,26 +463,59 @@ export class CommandHandler {
         { id: 'claude-haiku-4-5', label: 'Haiku 4.5', note: 'Fastest · 200k context' },
       ];
       const kimiModels = [
-        { id: 'kimi-code/k3', label: 'Kimi K3', note: 'Current Kimi Code subscription model' },
-        { id: 'kimi-code/kimi-for-coding-highspeed', label: 'Kimi for Coding Highspeed', note: 'Low-latency coding model when enabled for your account' },
+        { id: 'fast', label: 'Fast', note: 'Switch to the highspeed variant of the current model' },
+        { id: 'kimi-code/k3.1-pro', label: 'Kimi K3.1 Pro', note: 'Latest flagship · 1M context · thinking required' },
+        {
+          id: 'kimi-code/k3.1-pro-highspeed',
+          label: 'Kimi K3.1 Pro Highspeed',
+          note: '~2-3× output speed · 1M context',
+        },
+        { id: 'kimi-code/k3', label: 'Kimi K3', note: '1M context' },
+        { id: 'kimi-code/k3-256k', label: 'Kimi K3 256K', note: '256K context · lower quota usage' },
+        { id: 'kimi-code/kimi-for-coding', label: 'Kimi for Coding', note: 'K2.8 Preview · compatible coding model' },
+        {
+          id: 'kimi-code/kimi-for-coding-highspeed',
+          label: 'Kimi for Coding Highspeed',
+          note: 'Low-latency coding model when enabled for your account',
+        },
       ];
       const codexModels = [
-        { id: 'gpt-6-astra', label: 'GPT 6 Astra', note: 'Flagship Codex model · persistent context across windows (Codex ≥0.153)' },
-        { id: 'gpt-6-astra-pro', label: 'GPT 6 Astra Pro', note: 'Higher-capability Astra tier for Pro/Business/Enterprise accounts' },
+        { id: 'fast', label: 'Fast', note: 'Current Codex model with service tier fast' },
+        { id: 'gpt-6.1-sol', label: 'GPT 6.1 Sol', note: 'Flagship capability model' },
+        {
+          id: 'gpt-6-astra',
+          label: 'GPT 6 Astra',
+          note: 'Flagship Codex model · persistent context across windows (Codex ≥0.153)',
+        },
+        {
+          id: 'gpt-6-astra-pro',
+          label: 'GPT 6 Astra Pro',
+          note: 'Higher-capability Astra tier for Pro/Business/Enterprise accounts',
+        },
         { id: 'gpt-5.6', label: 'GPT 5.6', note: 'General GPT-5.6 Codex model' },
-        { id: 'gpt-5.6-sol', label: 'GPT 5.6 Sol', note: 'Flagship GPT-5.6 capability model' },
+        { id: 'gpt-5.6-sol', label: 'GPT 5.6 Sol', note: 'Legacy flagship capability model' },
         { id: 'gpt-5.6-terra', label: 'GPT 5.6 Terra', note: 'Stronger speed/cost balance for Codex workers' },
         { id: 'gpt-5.6-luna', label: 'GPT 5.6 Luna', note: 'Efficient high-volume Codex workloads' },
         { id: 'gpt-5.5', label: 'GPT 5.5', note: 'Legacy Codex model' },
-        { id: 'gpt-5.5-codex', label: 'GPT 5.5 Codex', note: 'Legacy Codex coding model, when available in your account' },
+        {
+          id: 'gpt-5.5-codex',
+          label: 'GPT 5.5 Codex',
+          note: 'Legacy Codex coding model, when available in your Codex account',
+        },
         { id: 'gpt-5.2-codex', label: 'GPT-5.2 Codex', note: 'Legacy Codex coding model' },
       ];
-      const models = activeEngine === 'kimi' ? kimiModels : activeEngine === 'codex' ? codexModels : claudeModels;
-      const header = activeEngine === 'kimi'
-        ? '**Available Kimi models:**'
-        : activeEngine === 'codex'
-          ? '**Common Codex models:**'
-          : '**Available Claude models:**';
+      const models =
+        activeEngine === 'kimi'
+          ? kimiModels
+          : activeEngine === 'codex'
+            ? codexModels
+            : claudeModels;
+      const header =
+        activeEngine === 'kimi'
+          ? '**Available Kimi models:**'
+          : activeEngine === 'codex'
+            ? '**Common Codex models:**'
+            : '**Available Claude models:**';
       const lines = [
         `**Current engine:** \`${activeEngine}\`${session.engine ? ' (session override)' : ''}`,
         '',
@@ -445,28 +525,39 @@ export class CommandHandler {
         '',
       ];
       for (const m of models) {
-        const marker = m.id === active ? ' ✅' : '';
+        const marker = m.id === active || (active && m.id.endsWith(`/${active}`)) ? ' ✅' : '';
         lines.push(`- \`${m.id}\` — ${m.label} · ${m.note}${marker}`);
       }
       lines.push('');
       if (activeEngine === 'claude') {
-        lines.push('_Tip: Fable 5 uses its native 1M context. For Opus/Sonnet, append `[1m]` to enable the 1M context window._');
+        lines.push(
+          '_Tip: Fable 5 uses its native 1M context. For Opus/Sonnet, append `[1m]` to enable the 1M context window._',
+        );
       } else if (activeEngine === 'codex') {
         lines.push('_Tip: leave unset to use the Codex CLI default from `~/.codex/config.toml`._');
       } else {
-        lines.push('_Tip: leave unset to use the Kimi Code Server default (recommended for subscription users)._');
+        lines.push(
+          '_Tip: leave unset to use the Kimi Code Server default (recommended for subscription users)._',
+        );
       }
       lines.push('Use `/model <name>` to set the model for the current engine.');
+      if (activeEngine === 'codex')
+        lines.push(
+          '组合：`/model gpt-6-astra|medium|fast`\nEffort: low / medium / high / xhigh / max / ultra\nSpeed: default / fast / flex\n空 effort 恢复默认；空 speed 关闭 Fast。例：`/model gpt-6-astra|high|`',
+        );
+      if (activeEngine === 'kimi')
+        lines.push(
+          'Fast：`/model fast` 切换到当前模型的高速版（k3.1-pro → k3.1-pro-highspeed，kimi-for-coding → kimi-for-coding-highspeed）。恢复：`/model <model>` 或 `/model reset`。',
+        );
       await this.sender.sendTextNotice(chatId, '🤖 Available Models', lines.join('\n'));
       return;
     }
-
-    // Reset — clear overrides (both engine AND model)
     if (normalized === 'reset' || normalized === 'clear' || normalized === 'default') {
       this.sessionManager.setSessionModel(chatId, undefined);
       this.sessionManager.setSessionEngine(chatId, undefined);
       this.sessionManager.setReasoningEffort(chatId, undefined);
-      const fallback = botDefault || '_default_';
+      this.sessionManager.setServiceTier(chatId, this.config.codex?.serviceTier ?? 'default');
+      const fallback = this.defaultModelForEngine(botEngine) || '_default_';
       await this.sender.sendTextNotice(
         chatId,
         '✅ Overrides Cleared',
@@ -475,14 +566,30 @@ export class CommandHandler {
       );
       return;
     }
-
-    // Set the model (use only the first token, ignore trailing junk)
-    const newModel = args.split(/\s+/)[0];
+    const parts = args.split('|').map((part) => part.trim());
+    const newModelRaw = parts[0].split(/\s+/)[0];
+    const effort = parts[1] ? normalizeCodexReasoningEffort(parts[1]) : undefined;
+    const tier = parts[2] === 'fast' || parts[2] === 'flex' || parts[2] === 'default' ? parts[2] : undefined;
+    if (
+      parts.length > 1 &&
+      (activeEngine !== 'codex' || parts.length > 3 || !newModelRaw || (parts[1] && !effort) || (parts[2] && !tier))
+    ) {
+      await this.sender.sendTextNotice(
+        chatId,
+        '❌ Invalid model options',
+        'Use `/model <model>|<effort>|<speed>`.',
+        'red',
+      );
+      return;
+    }
+    const newModel = newModelRaw;
     this.sessionManager.setSessionModel(chatId, newModel, activeEngine);
+    if (parts.length > 1) this.sessionManager.setReasoningEffort(chatId, effort);
+    if (parts.length > 2) this.sessionManager.setServiceTier(chatId, tier ?? 'default');
     await this.sender.sendTextNotice(
       chatId,
       '✅ Model Set',
-      `Session model set to \`${newModel}\` on engine \`${activeEngine}\`. It will take effect on the next message.`,
+      `Session model set to \`${newModel}\` on engine \`${activeEngine}\`${effort ? `, effort \`${effort}\`` : ''}${tier ? `, speed \`${tier}\`` : ''}. It will take effect on the next message.`,
       'green',
     );
   }
@@ -657,9 +764,9 @@ export class CommandHandler {
       case 'claude':
         return '`claude-fable-5`, `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`';
       case 'kimi':
-        return '`kimi-code/k3`, `kimi-code/kimi-for-coding-highspeed`';
+        return '`kimi-code/k3.1-pro`, `kimi-code/k3.1-pro-highspeed`, `kimi-code/k3`, `fast`';
       case 'codex':
-        return '`gpt-6-astra`, `gpt-6-astra-pro`, `gpt-5.6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`';
+        return '`gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-astra-pro`, `gpt-5.6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`';
     }
   }
 
@@ -679,16 +786,23 @@ function isEngineName(value: string): value is EngineName {
   return value === 'claude' || value === 'kimi' || value === 'codex';
 }
 
+const KIMI_HIGHSPEED_VARIANTS: Record<string, string> = {
+  'kimi-code/k3.1-pro': 'kimi-code/k3.1-pro-highspeed',
+  'kimi-code/kimi-for-coding': 'kimi-code/kimi-for-coding-highspeed',
+};
+
+function kimiFastModelId(current?: string): string {
+  const normalized = current?.trim();
+  if (normalized) {
+    if (normalized.endsWith('-highspeed')) return normalized;
+    const variant = KIMI_HIGHSPEED_VARIANTS[normalized] ?? KIMI_HIGHSPEED_VARIANTS[`kimi-code/${normalized}`];
+    if (variant) return variant;
+  }
+  return 'kimi-code/k3.1-pro-highspeed';
+}
+
 function normalizeCodexEffort(value: string): CodexReasoningEffort | 'reset' | undefined {
   const normalized = value.trim().toLowerCase();
   if (normalized === 'reset' || normalized === 'clear' || normalized === 'default') return 'reset';
-  if (
-    normalized === 'low' ||
-    normalized === 'medium' ||
-    normalized === 'high' ||
-    normalized === 'xhigh' ||
-    normalized === 'max' ||
-    normalized === 'ultra'
-  ) return normalized;
-  return undefined;
+  return normalizeCodexReasoningEffort(normalized);
 }
