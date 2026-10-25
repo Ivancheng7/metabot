@@ -187,8 +187,14 @@ export const ptyQuery = (args: {
   // up front and may only submit/acknowledge while it is unchanged, so text
   // pasted into the composer of an ending turn never becomes a fresh turn.
   let turnGeneration = 0;
-  let interrupting = false;
-  let typing = false;
+  // Counter, not a boolean: overlapping interrupts must not clear each other.
+  let interrupts = 0;
+  // Single owner of composer writes (prompt typing or steer submission). Each
+  // writer holds its own token and can only release that token, so a stale
+  // operation finishing late can never free the composer under a newer one.
+  let composerOwner: symbol | null = null;
+  let composerFreed: Promise<void> = Promise.resolve();
+  let signalComposerFreed: () => void = () => {};
   let session: ReturnType<typeof createPtyClaudeSession> | null = null;
   let scanner: ReturnType<typeof createJsonlScanner> | null = null;
   // Map the SDK-style systemPrompt ({type:'preset', append}) → --append flag.
@@ -448,6 +454,25 @@ export const ptyQuery = (args: {
     if (typeof model === 'string' && model) lastUsage.model = model;
   }
 
+  /**
+   * Take the composer. Prompts wait their turn; steers pass `wait: false`
+   * and fail fast instead of queueing behind other input.
+   */
+  async function claimComposer(wait: boolean): Promise<(() => void) | null> {
+    while (composerOwner) {
+      if (!wait || disposed) return null;
+      await composerFreed;
+    }
+    const token = Symbol('composer');
+    composerOwner = token;
+    composerFreed = new Promise<void>(resolve => { signalComposerFreed = resolve; });
+    return () => {
+      if (composerOwner !== token) return;
+      composerOwner = null;
+      signalComposerFreed();
+    };
+  }
+
   // ── Prompt loop ──────────────────────────────────────────────────────────
   async function runPromptLoop(): Promise<void> {
     try {
@@ -462,11 +487,13 @@ export const ptyQuery = (args: {
         }
         if (!session) await boot; // ensure session exists
         if (!session || disposed) break;
+        // Wait for any in-flight steer to submit or withdraw its text first.
+        const release = await claimComposer(true);
+        if (!release || disposed) break;
         turnInFlight = true; // a new turn starts the moment we submit the prompt
         turnGeneration++;
-        typing = true;
         try { await session.typePrompt(text); }
-        finally { typing = false; }
+        finally { release(); }
         // Client-side slash commands (/effort, /model, /status, …) change a
         // setting WITHOUT a model turn → no assistant record, no Stop hook, so
         // no `result` would ever be synthesized and the caller's turn hangs.
@@ -564,9 +591,9 @@ export const ptyQuery = (args: {
   async function interrupt(): Promise<void> {
     // Invalidate any steer that is mid-submission before keys go to the TUI.
     turnGeneration++;
-    interrupting = true;
+    interrupts++;
     try { await interruptSession(); }
-    finally { interrupting = false; }
+    finally { interrupts--; }
   }
 
   async function interruptSession(): Promise<void> {
@@ -606,6 +633,7 @@ export const ptyQuery = (args: {
   async function dispose(): Promise<void> {
     if (disposed) return;
     disposed = true;
+    signalComposerFreed(); // wake a prompt waiting for the composer so it exits
     try {
       scanner?.stop();
     } catch {
@@ -627,16 +655,18 @@ export const ptyQuery = (args: {
   // ── The drop-in PtyQuery ─────────────────────────────────────────────────
   const query: PtyQuery = {
     [Symbol.asyncIterator]: () => out[Symbol.asyncIterator](),
-    canSteer: () => turnInFlight && !typing && !interrupting && !disposed && !!session?.steerPrompt,
+    canSteer: () => turnInFlight && !composerOwner && interrupts === 0 && !disposed && !!session?.steerPrompt,
     async steer(text) {
       if (!query.canSteer?.() || !session?.steerPrompt) return 'no-active-turn';
+      const release = await claimComposer(false);
+      if (!release) return 'no-active-turn';
       const generation = turnGeneration;
-      const owned = () => turnInFlight && turnGeneration === generation && !interrupting && !disposed;
-      typing = true;
+      const owned = () => turnInFlight && turnGeneration === generation && interrupts === 0 && !disposed;
       try {
+        if (!owned()) return 'no-active-turn';
         const submitted = await session.steerPrompt(text, owned);
         return submitted !== false && owned() ? 'steered' : 'no-active-turn';
-      } finally { typing = false; }
+      } finally { release(); }
     },
     interrupt,
     dispose,

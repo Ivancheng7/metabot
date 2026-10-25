@@ -117,10 +117,83 @@ describe('Claude Code native controls', () => {
     await hold.held();
     stop();
     send('queued follow-up');
-    await vi.waitFor(() => expect(fake.session.typePrompt).toHaveBeenCalledWith('queued follow-up'));
+    // The follow-up waits for the stale steer to finish withdrawing its text.
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(fake.session.typePrompt).not.toHaveBeenCalledWith('queued follow-up');
     hold.release();
     expect(await pending).toBe('no-active-turn');
+    await vi.waitFor(() => expect(fake.session.typePrompt).toHaveBeenCalledWith('queued follow-up'));
     expect(hold.ownedAtEnter()).toBe(false);
     expect(fake.session.typePrompt).not.toHaveBeenCalledWith(expect.stringContaining('late direction'));
   });
+
+  it('keeps steering blocked while a follow-up prompt is still being typed after a stale steer', async () => {
+    const input = new AsyncQueue<PtyUserMessage>();
+    const hooks: PtyHookBridge = {
+      writeSettings: async () => '/unused-settings',
+      onTurnComplete() {}, onTeamEvent() {}, dispose: async () => {},
+    };
+    const query = ptyQuery({ prompt: input, options: { cwd: '/unused', logger: createLogger('silent'), hookBridge: hooks } });
+    queries.push(query);
+    const send = (content: string) => input.enqueue({ type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: '' });
+    send('first');
+    await vi.waitFor(() => expect(fake.session.typePrompt).toHaveBeenCalledWith('first'));
+    const hold = holdSteer();
+    const stale = query.steer!('stale direction');
+    await hold.held();
+    await query.interrupt();
+    let finishTyping!: () => void;
+    fake.session.typePrompt.mockImplementationOnce(() => new Promise<void>(resolve => { finishTyping = resolve; }));
+    send('follow-up');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(fake.session.typePrompt).not.toHaveBeenCalledWith('follow-up');
+    hold.release();
+    expect(await stale).toBe('no-active-turn');
+    await vi.waitFor(() => expect(fake.session.typePrompt).toHaveBeenCalledWith('follow-up'));
+    // The follow-up is still being typed: no other composer write may start.
+    expect(query.canSteer?.()).toBe(false);
+    const steerCalls = fake.session.steerPrompt.mock.calls.length;
+    expect(await query.steer!('interleaved')).toBe('no-active-turn');
+    expect(fake.session.steerPrompt).toHaveBeenCalledTimes(steerCalls);
+    finishTyping();
+    await vi.waitFor(() => expect(query.canSteer?.()).toBe(true));
+  });
+
+  it('keeps steering blocked until every overlapping interrupt has finished', async () => {
+    const ctx = await start('initial task');
+    let finishFirst!: () => void;
+    fake.session.interrupt.mockImplementationOnce(() => new Promise<void>(resolve => { finishFirst = resolve; }));
+    let finishSecond!: () => void;
+    fake.session.interrupt.mockImplementationOnce(() => new Promise<void>(resolve => { finishSecond = resolve; }));
+    const first = ctx.query.interrupt();
+    const second = ctx.query.interrupt();
+    await vi.waitFor(() => expect(fake.session.interrupt).toHaveBeenCalledTimes(2));
+    finishFirst();
+    await first;
+    expect(ctx.query.canSteer?.()).toBe(false);
+    expect(await ctx.query.steer!('during second interrupt')).toBe('no-active-turn');
+    expect(fake.session.steerPrompt).not.toHaveBeenCalled();
+    finishSecond();
+    await second;
+  });
+
+  it('does not write a steer to the PTY while a prompt is being typed', async () => {
+    const input = new AsyncQueue<PtyUserMessage>();
+    const hooks: PtyHookBridge = {
+      writeSettings: async () => '/unused-settings',
+      onTurnComplete() {}, onTeamEvent() {}, dispose: async () => {},
+    };
+    let finishTyping!: () => void;
+    fake.session.typePrompt.mockImplementationOnce(() => new Promise<void>(resolve => { finishTyping = resolve; }));
+    const query = ptyQuery({ prompt: input, options: { cwd: '/unused', logger: createLogger('silent'), hookBridge: hooks } });
+    queries.push(query);
+    input.enqueue({ type: 'user', message: { role: 'user', content: 'slow prompt' }, parent_tool_use_id: null, session_id: '' });
+    await vi.waitFor(() => expect(fake.session.typePrompt).toHaveBeenCalledWith('slow prompt'));
+    expect(query.canSteer?.()).toBe(false);
+    expect(await query.steer!('too early')).toBe('no-active-turn');
+    expect(fake.session.steerPrompt).not.toHaveBeenCalled();
+    finishTyping();
+    await vi.waitFor(() => expect(query.canSteer?.()).toBe(true));
+  });
 });
+

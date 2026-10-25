@@ -260,7 +260,7 @@ class PtyClaudeSessionImpl implements IPtyClaudeSession {
    * empty composer — rather than Ctrl-C, whose second press exits claude.
    */
   private async clearComposer(lines: number): Promise<void> {
-    if (this.interrupting) await this.interrupting;
+    while (this.interrupting) await this.interrupting;
     if (!this.term || this.disposed) return;
     this.term.write('\x15\x7f'.repeat(lines) + '\x15');
     await sleep(100);
@@ -278,7 +278,7 @@ class PtyClaudeSessionImpl implements IPtyClaudeSession {
 
   async typePrompt(text: string): Promise<void> {
     await this.ready(); // boot: wait for the TUI to first come up
-    if (this.steering) await this.steering.catch(() => {});
+    while (this.steering) await this.steering.catch(() => {});
     // Per-call readiness: ready() is memoized after boot, so on its own it would
     // let us type the INSTANT a turn is requested — even while claude is still
     // mid-interrupt. That's the "no response" bug: after a keep-planning Esc
