@@ -43,6 +43,7 @@ export interface CoreChatRunRequest {
   userId?: string;
   engine?: EngineName;
   model?: string;
+  notification?: 'result' | 'error';
   presentation?: {
     mode: 'child-direct' | 'origin-proxy';
     chatId: string;
@@ -190,6 +191,7 @@ export function parseCoreChatRunRequest(body: Record<string, unknown>): { reques
       userId: asString(body.userId),
       engine: asEngineName(body.engine),
       model: asString(body.model),
+      notification: body.notification === 'result' || body.notification === 'error' ? body.notification : undefined,
       presentation,
       maxTurns,
       allowedTools: asStringArray(body.allowedTools),
@@ -573,7 +575,22 @@ async function runCoreChatTask(ctx: RouteContext, request: CoreChatRunRequest, e
       dispatcher.enqueue('log', voiceRunPayload(ctx, request));
     }
 
-    const result = await bot.bridge.executeApiTask({
+    let steered = false;
+    if (request.notification) {
+      const deadline = Date.now() + 5 * 60_000;
+      while (bot.bridge.isBusy(executionChatId)) {
+        if (activeCoreChatRuns.get(request.runId)?.status === 'canceled') return;
+        steered = request.notification === 'result'
+          && await bot.bridge.steerAgentNotification(executionChatId, request.prompt);
+        if (steered) break;
+        if (Date.now() >= deadline) throw new Error('Notification origin remained busy; result is available in session history');
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+    if (activeCoreChatRuns.get(request.runId)?.status === 'canceled') return;
+    const result: ApiTaskResult = steered
+      ? { success: true, responseText: 'Agent Bus notification delivered to the active turn.' }
+      : await bot.bridge.executeApiTask({
       prompt: request.prompt,
       chatId: executionChatId,
       userId: request.userId ?? 'core-chat',

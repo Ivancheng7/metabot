@@ -98,6 +98,31 @@ Core 会持久化消息和逻辑运行、解析目标会话，并返回 `message
 在飞书来源会话中，可用 `--origin-chat <oc_...> --origin-bot <name>` 将运行事件投影回来源
 Bot；`--child-direct` 则让结果显示在目标 Agent 会话。
 
+#### Bus 会话与结果回传
+
+```bash
+metabot send sessions <agentId> [--limit N] [--offset N]
+metabot send history <sessionId> [--limit N] [--before <messageId>]
+metabot send <agentId> "prompt" --session <sessionId> --sender-session <ownedSessionId>
+metabot send <agentId> "prompt" --child-direct
+```
+
+会话列表在分页前按 Agent 所有权或房间成员身份过滤；Agent 可见不代表其他用户的
+会话公开，也不允许向其房间注入消息。不指定目标会话且没有可访问会话时，会创建独立
+上下文。历史每页按插入顺序返回，默认 20 条、最多 200 条；用 `hasMore`、
+`oldestMessageId` 和 `--before` 向前翻页。会话标题取首条消息，合并空白后最多
+40 字符，保留已有自定义标题。目标不唯一时，错误会列出可用会话供 `--session` 重试。
+
+`--sender-session` 必须属于发送者拥有的 Agent；已绑定房间时还要求发送者是房间
+成员。任务结束后通过正常 Core run 分发回传：成功通知最多包含 800 字符摘要，失败
+保留完整错误，两者均附拉取完整 run 事件的命令。回传去重、不触发通知循环，同房间
+发送不重复回传。发送会话绑定飞书时按 child-direct 呈现，否则保留在 Bus 房间；
+发送会话离线也不丢失持久化结果。
+
+目标会话的 `--child-direct` 必须显式启用，历史 transport 绑定不会自动发卡。
+`--implicit` 仅禁止目标呈现，不取消显式请求的结果回传。origin-proxy 保持已有投影
+路径，不再重复发送会话通知；本次会话 API 不包含旧 bridge 投影和 steering 架构迁移。
+
 ### Peers
 
 ```bash
