@@ -336,6 +336,50 @@ export interface VoiceTranscribeResponse {
   error?: string;
 }
 
+export interface MessageSession {
+  id: string;
+  agentId: string;
+  agentName: string;
+  provider?: string;
+  status: 'online' | 'resumable' | 'offline' | 'provisioning';
+  roomId?: string;
+  title?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ListAgentSessionsResult {
+  agentId: string;
+  agentName: string;
+  sessions: MessageSession[];
+  total: number;
+  hasMore: boolean;
+  nextOffset: number | null;
+}
+
+export interface SessionHistoryResult {
+  sessionId: string;
+  agentId: string;
+  agentName: string;
+  roomId: string | null;
+  sessionStatus: MessageSession['status'];
+  sessionTitle: string | null;
+  messages: ChatMessage[];
+  hasMore: boolean;
+  oldestMessageId: string | null;
+}
+
+export interface SendSessionMessageResult {
+  ok: boolean;
+  messageId: string;
+  sessionId: string;
+  runId: string;
+  correlationId: string;
+  agentId: string;
+  agentName: string;
+  idempotentReplay?: boolean;
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -510,6 +554,26 @@ export const api = {
         body: JSON.stringify({ messageId }),
       },
     ),
+
+  listAgentSessions: (agentRef: string, options: { limit?: number; offset?: number } = {}) => {
+    const params = new URLSearchParams({ agentId: agentRef });
+    if (options.limit) params.set('limit', String(options.limit));
+    if (options.offset) params.set('offset', String(options.offset));
+    return request<ListAgentSessionsResult>(`/api/messages/sessions?${params.toString()}`);
+  },
+
+  listSessionHistory: (sessionId: string, options: { limit?: number; before?: string } = {}) => {
+    const params = new URLSearchParams({ sessionId });
+    if (options.limit) params.set('limit', String(options.limit));
+    if (options.before) params.set('before', options.before);
+    return request<SessionHistoryResult>(`/api/messages/history?${params.toString()}`);
+  },
+
+  sendSessionMessage: (input: { agentId: string; sessionId: string; message: string }) =>
+    request<SendSessionMessageResult>('/api/messages', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
 
   getT5tBoard: () => request<BoardResponse>('/api/t5t/board'),
   getT5tProject: (slug: string) => request<ProjectDetailResponse>(`/api/t5t/projects/${encodeURIComponent(slug)}`),
