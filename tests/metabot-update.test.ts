@@ -171,7 +171,7 @@ describe('metabot update source selection', () => {
     expect(source).toContain("require('./package.json').metabotEdition");
     expect(source).toContain('npm run build -w @xvirobotics/metabot-core-server');
     expect(source).toContain('npm run build -w @xvirobotics/metabot-core-web-ui');
-    expect(source).toContain('pm2 restart metabot-core --update-env');
+    expect(source).toContain('pm2 restart metabot-core --interpreter "$METABOT_NODE_PATH" --update-env');
   });
 });
 
