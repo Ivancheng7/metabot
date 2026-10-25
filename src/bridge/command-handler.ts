@@ -65,12 +65,14 @@ export class CommandHandler {
     this.audit.log({ event: 'command', botName: this.config.name, chatId, userId, prompt: cmd });
 
     switch (cmd.toLowerCase()) {
+      case '/?':
       case '/help':
         await this.sender.sendTextNotice(chatId, '📖 Help', [
           '**Bot Commands:**',
-          '`/reset` - Clear session, start fresh',
+          '`/reset` or `/new` - Clear session, start fresh',
           '`/stop` - Abort current running task',
           '`/compact` - Compact the current session while idle (Codex / Claude Code PTY); messages queue',
+          '`/append <text>` or `/steer <text>` - Steer the active task (Codex app-server / Claude Code PTY)',
           '`/status` - Show current session info',
           '`/model` - Show current engine/model; `/model list` - Available options',
           '`/model claude`, `/model kimi`, or `/model codex` - Switch engine (resets session)',
@@ -80,7 +82,7 @@ export class CommandHandler {
           '`/resume <id>` - Resume a session directly by id prefix',
           '`/memory` - Memory document commands',
           '`@Bot /group-reply mention|all|status` - Feishu group reply mode (scoped to this Agent and group)',
-          '`/help` - Show this help message',
+          '`/help` or `/?` - Show this help message',
           '',
           '**Agent Commands:**',
           '`/goal <description>` - Set a goal the agent keeps pursuing across turns (Claude native, Codex bridge-managed)',
@@ -103,6 +105,7 @@ export class CommandHandler {
         ].join('\n'));
         return true;
 
+      case '/new':
       case '/reset':
         {
           const task = this.getActiveTask(chatId);

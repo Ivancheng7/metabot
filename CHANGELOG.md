@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-10-25
+
+### Added
+
+- Added `/new` as a reset alias and `/?` as a help alias.
+- Added opt-outs for prompt/response persistence in the activity database and prompt persistence in audit logs.
+
+### Fixed
+
+- Preserved final response delivery when card updates are rate-limited by trying a replacement card before the text fallback.
+- Responded to bare Feishu bot mentions with a request to retrieve the current chat or topic context through user-managed Lark tooling.
+- Prevented Agent Teams card enrichment from failing in-flight turns when the store closes during shutdown.
+- Guarded connecting WebSocket termination and routed Feishu SDK diagnostics through credential-redacting logs.
+- Acknowledged the Claude PTY permission mode already selected by the launch flag so unattended startup can proceed.
+
 ## [1.3.2] - 2026-09-15
 
 ### Added
