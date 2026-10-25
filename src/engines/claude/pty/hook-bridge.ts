@@ -41,6 +41,36 @@ export interface HookBridgeOptions {
 }
 
 /**
+ * Build the `PostCompact` hook command that writes the compaction sentinel.
+ *
+ * `/compact` waits exclusively for this sentinel, so the command must run on
+ * every host OS and survive any temp path:
+ *
+ *   - It uses the current Node binary instead of `cat`, which does not exist
+ *     when Windows runs hooks through `cmd`.
+ *   - Both the Node path and the sentinel path are quoted, so spaces (common in
+ *     temp dirs and `C:\Program Files`) and shell metacharacters survive.
+ *
+ * The hook JSON arrives on stdin and is copied into the sentinel; the watcher
+ * only needs the file to change.
+ */
+export function buildPostCompactHookCommand(
+  compactPath: string,
+  platform: NodeJS.Platform = process.platform,
+  nodePath: string = process.execPath,
+): string {
+  // No double quotes, `$` or backticks, so the script is inert in both quoting styles.
+  const script = "const f=require('fs');let d='';try{d=f.readFileSync(0)}catch{}f.writeFileSync(process.argv[1],d.length?d:'compact')";
+  if (platform === 'win32') {
+    // Windows paths cannot contain `"`, so double quotes are safe for cmd and Git Bash.
+    return `"${nodePath}" -e "${script}" "${compactPath}"`;
+  }
+  // POSIX: close the single-quoted string, append an escaped quote, reopen.
+  const quote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
+  return `${quote(nodePath)} -e ${quote(script)} ${quote(compactPath)}`;
+}
+
+/**
  * Create a new PtyHookBridge instance. Each instance owns a temp directory
  * for its sentinel/event files and generated settings.json.
  */
@@ -73,7 +103,7 @@ export function createHookBridge(options?: HookBridgeOptions): PtyHookBridge {
     const stopCommand = `cat > ${sentinelPath}`;
 
     const hooks: Record<string, unknown> = {
-      PostCompact: [{ matcher: 'manual', hooks: [{ type: 'command', command: `cat > ${compactPath}` }] }],
+      PostCompact: [{ matcher: 'manual', hooks: [{ type: 'command', command: buildPostCompactHookCommand(compactPath) }] }],
       Stop: [
         {
           hooks: [{ type: 'command', command: stopCommand }],
