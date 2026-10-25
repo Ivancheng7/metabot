@@ -18,6 +18,11 @@ createInterface({ input: process.stdin }).on('line', line => {
     if (process.env.SCENARIO === 'exit') process.exit(2);
   }
   if (m.method === 'turn/steer') {
+    if (process.env.SCENARIO === 'complete-during-steer') {
+      complete();
+      send({ id: m.id, error: { code: -32600, message: 'No active turn' } });
+      return;
+    }
     if (process.env.SCENARIO === 'reject') {
       send({ id: m.id, error: { code: -32600, message: 'No active turn' } });
       return;

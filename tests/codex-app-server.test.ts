@@ -54,6 +54,14 @@ describe('Codex app-server native controls', () => {
     await ctx.drained;
   });
 
+  it('reports no active turn when the turn completes while steering is pending', async () => {
+    const ctx = start('complete-during-steer');
+    await vi.waitFor(() => expect(ctx.run.canSteer()).toBe(true));
+    expect(await ctx.run.steer('late')).toBe('no-active-turn');
+    await ctx.drained;
+    expect(ctx.requests().filter(r => r.method === 'turn/start')).toHaveLength(1);
+  });
+
   it('reports unexpected process exit as failure', async () => {
     const ctx = start('exit');
     await ctx.drained;

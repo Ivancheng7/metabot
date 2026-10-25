@@ -216,9 +216,17 @@ export function startAppServerRun(input: {
     async steer(text) {
       if (done || !threadId || !turnId) return 'no-active-turn';
       const expectedTurnId = turnId;
-      const result = await request<{ turnId: string }>('turn/steer', {
-        threadId, expectedTurnId, input: [{ type: 'text', text }],
-      });
+      let result: { turnId: string };
+      try {
+        result = await request<{ turnId: string }>('turn/steer', {
+          threadId, expectedTurnId, input: [{ type: 'text', text }],
+        });
+      } catch (err) {
+        // The server checks expectedTurnId atomically; a rejection after the
+        // turn ended means the input was not accepted, not an unknown state.
+        if (done || turnId !== expectedTurnId) return 'no-active-turn';
+        throw err;
+      }
       if (result.turnId !== expectedTurnId) throw new Error('Codex accepted input for an unexpected turn');
       return 'steered';
     },

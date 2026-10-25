@@ -7,7 +7,7 @@ const fake = vi.hoisted(() => ({
   session: {
     sessionId: 'claude-session', jsonlPath: '/unused',
     ready: vi.fn(async () => {}), typePrompt: vi.fn(async () => {}),
-    steerPrompt: vi.fn(async () => {}), screen: vi.fn(() => '❯'),
+    steerPrompt: vi.fn(async (_text: string, _isCurrent?: () => boolean) => true), screen: vi.fn(() => '❯'),
     snapshot: vi.fn(() => '❯'), sendKeys: vi.fn(),
     interrupt: vi.fn(async () => {}), dispose: vi.fn(async () => {}),
   },
@@ -46,11 +46,81 @@ describe('Claude Code native controls', () => {
     const ctx = await start('initial task');
     expect(ctx.query.canSteer?.()).toBe(true);
     expect(await ctx.query.steer?.('new direction')).toBe('steered');
-    expect(fake.session.steerPrompt).toHaveBeenCalledWith('new direction');
+    expect(fake.session.steerPrompt).toHaveBeenCalledWith('new direction', expect.any(Function));
     expect(fake.session.typePrompt).toHaveBeenCalledTimes(1);
     expect(fake.session.interrupt).not.toHaveBeenCalled();
     ctx.stop();
     expect(await ctx.query.steer?.('late')).toBe('no-active-turn');
   });
 
+  /** Hold steerPrompt until released; report what ownership looked like before "Enter". */
+  function holdSteer() {
+    let release!: () => void;
+    let owned: boolean | undefined;
+    fake.session.steerPrompt.mockImplementationOnce((_text, isCurrent) => new Promise<boolean>(resolve => {
+      release = () => { owned = isCurrent?.() ?? true; resolve(owned); };
+    }));
+    return { release: () => release(), ownedAtEnter: () => owned, held: () => vi.waitFor(() => expect(release).toBeDefined()) };
+  }
+
+  it('rejects steering when the turn completes during submission', async () => {
+    const ctx = await start('initial task');
+    const hold = holdSteer();
+    const pending = ctx.query.steer!('late direction');
+    await hold.held();
+    ctx.stop();
+    hold.release();
+    expect(await pending).toBe('no-active-turn');
+    expect(hold.ownedAtEnter()).toBe(false);
+  });
+
+  it('rejects steering when the turn completes even if the session ignored ownership', async () => {
+    const ctx = await start('initial task');
+    let release!: () => void;
+    fake.session.steerPrompt.mockImplementationOnce(() => new Promise<boolean>(resolve => { release = () => resolve(true); }));
+    const pending = ctx.query.steer!('late direction');
+    await vi.waitFor(() => expect(release).toBeDefined());
+    ctx.stop();
+    release();
+    expect(await pending).toBe('no-active-turn');
+  });
+
+  it('rejects steering when the turn is cancelled during submission', async () => {
+    const ctx = await start('initial task');
+    const hold = holdSteer();
+    const pending = ctx.query.steer!('late direction');
+    await hold.held();
+    const interrupted = ctx.query.interrupt();
+    expect(ctx.query.canSteer?.()).toBe(false);
+    hold.release();
+    await interrupted;
+    expect(await pending).toBe('no-active-turn');
+    expect(hold.ownedAtEnter()).toBe(false);
+    expect(await ctx.query.steer!('after stop')).toBe('no-active-turn');
+  });
+
+  it('does not let a stale steer claim the next turn', async () => {
+    const input = new AsyncQueue<PtyUserMessage>();
+    let stop!: () => void;
+    const hooks: PtyHookBridge = {
+      writeSettings: async () => '/unused-settings',
+      onTurnComplete: cb => { stop = cb; },
+      onTeamEvent() {}, dispose: async () => {},
+    };
+    const query = ptyQuery({ prompt: input, options: { cwd: '/unused', logger: createLogger('silent'), hookBridge: hooks } });
+    queries.push(query);
+    const send = (content: string) => input.enqueue({ type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: '' });
+    send('first');
+    await vi.waitFor(() => expect(fake.session.typePrompt).toHaveBeenCalledWith('first'));
+    const hold = holdSteer();
+    const pending = query.steer!('late direction');
+    await hold.held();
+    stop();
+    send('queued follow-up');
+    await vi.waitFor(() => expect(fake.session.typePrompt).toHaveBeenCalledWith('queued follow-up'));
+    hold.release();
+    expect(await pending).toBe('no-active-turn');
+    expect(hold.ownedAtEnter()).toBe(false);
+    expect(fake.session.typePrompt).not.toHaveBeenCalledWith(expect.stringContaining('late direction'));
+  });
 });

@@ -205,8 +205,12 @@ export interface PtyClaudeSession {
   ready(): Promise<void>;
   /** Type a prompt string into the TUI and submit it. */
   typePrompt(text: string): Promise<void>;
-  /** Submit plain text while the model is working, without interrupting it. */
-  steerPrompt?(text: string): Promise<void>;
+  /**
+   * Submit plain text while the model is working, without interrupting it.
+   * `isCurrent` is re-checked before the terminal Enter; if the turn was lost
+   * meanwhile the pasted text is cleared instead and this resolves false.
+   */
+  steerPrompt?(text: string, isCurrent?: () => boolean): Promise<boolean>;
   /**
    * Write raw bytes to the PTY (no prompt-submit framing). Used by the
    * interactive-tool keystroke layer to drive native TUI menus.
