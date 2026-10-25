@@ -183,6 +183,18 @@ export const ptyQuery = (args: {
   // terminal `result` is emitted (Stop hook). The exit watchdog uses it to
   // decide whether an unexpected claude death orphaned an in-flight turn.
   let turnInFlight = false;
+  // Bumped whenever a turn starts, ends or is interrupted. A steer captures it
+  // up front and may only submit/acknowledge while it is unchanged, so text
+  // pasted into the composer of an ending turn never becomes a fresh turn.
+  let turnGeneration = 0;
+  // Counter, not a boolean: overlapping interrupts must not clear each other.
+  let interrupts = 0;
+  // Single owner of composer writes (prompt typing or steer submission). Each
+  // writer holds its own token and can only release that token, so a stale
+  // operation finishing late can never free the composer under a newer one.
+  let composerOwner: symbol | null = null;
+  let composerFreed: Promise<void> = Promise.resolve();
+  let signalComposerFreed: () => void = () => {};
   let session: ReturnType<typeof createPtyClaudeSession> | null = null;
   let scanner: ReturnType<typeof createJsonlScanner> | null = null;
   // Map the SDK-style systemPrompt ({type:'preset', append}) → --append flag.
@@ -221,7 +233,7 @@ export const ptyQuery = (args: {
       if (disposed) return;
       // Mark the turn complete IMMEDIATELY (not in the drain timeout below) so
       // the slash-command idle watchdog stands down and never double-emits.
-      turnInFlight = false;
+      endTurn();
       const usage = { ...lastUsage };
       // Reset for the next turn.
       lastUsage = {};
@@ -310,7 +322,7 @@ export const ptyQuery = (args: {
         await sleep(500); // let claude's interrupt line land first
         if (turnInFlight && !disposed) {
           logger.info('ptyQuery: keep-planning — synthesizing terminal result to end turn');
-          turnInFlight = false;
+          endTurn();
           const usage = { ...lastUsage };
           lastUsage = {};
           out.enqueue(
@@ -442,6 +454,25 @@ export const ptyQuery = (args: {
     if (typeof model === 'string' && model) lastUsage.model = model;
   }
 
+  /**
+   * Take the composer. Prompts wait their turn; steers pass `wait: false`
+   * and fail fast instead of queueing behind other input.
+   */
+  async function claimComposer(wait: boolean): Promise<(() => void) | null> {
+    while (composerOwner) {
+      if (!wait || disposed) return null;
+      await composerFreed;
+    }
+    const token = Symbol('composer');
+    composerOwner = token;
+    composerFreed = new Promise<void>(resolve => { signalComposerFreed = resolve; });
+    return () => {
+      if (composerOwner !== token) return;
+      composerOwner = null;
+      signalComposerFreed();
+    };
+  }
+
   // ── Prompt loop ──────────────────────────────────────────────────────────
   async function runPromptLoop(): Promise<void> {
     try {
@@ -456,8 +487,13 @@ export const ptyQuery = (args: {
         }
         if (!session) await boot; // ensure session exists
         if (!session || disposed) break;
+        // Wait for any in-flight steer to submit or withdraw its text first.
+        const release = await claimComposer(true);
+        if (!release || disposed) break;
         turnInFlight = true; // a new turn starts the moment we submit the prompt
-        await session.typePrompt(text);
+        turnGeneration++;
+        try { await session.typePrompt(text); }
+        finally { release(); }
         // Client-side slash commands (/effort, /model, /status, …) change a
         // setting WITHOUT a model turn → no assistant record, no Stop hook, so
         // no `result` would ever be synthesized and the caller's turn hangs.
@@ -499,7 +535,7 @@ export const ptyQuery = (args: {
       if (sawRunning) return; // real model turn — let the Stop-hook path finish it
       if (elapsed > SLASH_GRACE_MS) {
         // No model turn ever started → client-side command. Complete the turn.
-        turnInFlight = false;
+        endTurn();
         logger.info('ptyQuery: slash command ran with no model turn — synthesizing result');
         out.enqueue(
           synthesizeResult({
@@ -513,6 +549,12 @@ export const ptyQuery = (args: {
       if (elapsed > SLASH_MAX_MS) return; // bail; Stop/exit watchdog is the backstop
       await sleep(300);
     }
+  }
+
+  /** Mark the in-flight turn finished and invalidate any pending steer. */
+  function endTurn(): void {
+    turnInFlight = false;
+    turnGeneration++;
   }
 
   // ── Exit watchdog ──────────────────────────────────────────────────────────
@@ -529,7 +571,7 @@ export const ptyQuery = (args: {
     if (disposed) return; // normal teardown via dispose()
     logger.warn({ ...info, turnInFlight }, 'ptyQuery: claude exited unexpectedly');
     if (turnInFlight) {
-      turnInFlight = false;
+      endTurn();
       out.enqueue(
         synthesizeResult({
           sessionId,
@@ -547,6 +589,14 @@ export const ptyQuery = (args: {
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
   async function interrupt(): Promise<void> {
+    // Invalidate any steer that is mid-submission before keys go to the TUI.
+    turnGeneration++;
+    interrupts++;
+    try { await interruptSession(); }
+    finally { interrupts--; }
+  }
+
+  async function interruptSession(): Promise<void> {
     if (!session) {
       // Boot may still be in flight; wait briefly then try.
       try {
@@ -566,7 +616,7 @@ export const ptyQuery = (args: {
     // Synthesize the terminal result here, guarded by turnInFlight so we never
     // double-emit against the Stop-hook path (mirrors handleSessionExit).
     if (turnInFlight && !disposed) {
-      turnInFlight = false;
+      endTurn();
       logger.info('ptyQuery: turn interrupted — synthesizing terminal result');
       out.enqueue(
         synthesizeResult({
@@ -583,6 +633,7 @@ export const ptyQuery = (args: {
   async function dispose(): Promise<void> {
     if (disposed) return;
     disposed = true;
+    signalComposerFreed(); // wake a prompt waiting for the composer so it exits
     try {
       scanner?.stop();
     } catch {
@@ -604,6 +655,19 @@ export const ptyQuery = (args: {
   // ── The drop-in PtyQuery ─────────────────────────────────────────────────
   const query: PtyQuery = {
     [Symbol.asyncIterator]: () => out[Symbol.asyncIterator](),
+    canSteer: () => turnInFlight && !composerOwner && interrupts === 0 && !disposed && !!session?.steerPrompt,
+    async steer(text) {
+      if (!query.canSteer?.() || !session?.steerPrompt) return 'no-active-turn';
+      const release = await claimComposer(false);
+      if (!release) return 'no-active-turn';
+      const generation = turnGeneration;
+      const owned = () => turnInFlight && turnGeneration === generation && interrupts === 0 && !disposed;
+      try {
+        if (!owned()) return 'no-active-turn';
+        const submitted = await session.steerPrompt(text, owned);
+        return submitted !== false && owned() ? 'steered' : 'no-active-turn';
+      } finally { release(); }
+    },
     interrupt,
     dispose,
   };
