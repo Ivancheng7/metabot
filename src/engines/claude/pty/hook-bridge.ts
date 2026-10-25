@@ -40,34 +40,38 @@ export interface HookBridgeOptions {
   teamEvents?: boolean;
 }
 
+/** A command hook in Claude Code's exec form (`args` present → no shell). */
+export interface ExecCommandHook {
+  type: 'command';
+  command: string;
+  args: string[];
+}
+
 /**
- * Build the `PostCompact` hook command that writes the compaction sentinel.
+ * Build the `PostCompact` hook that writes the compaction sentinel.
  *
- * `/compact` waits exclusively for this sentinel, so the command must run on
- * every host OS and survive any temp path:
+ * `/compact` waits exclusively for this sentinel, so the hook must not depend
+ * on how any shell parses the temp path:
  *
- *   - It uses the current Node binary instead of `cat`, which does not exist
- *     when Windows runs hooks through `cmd`.
- *   - Both the Node path and the sentinel path are quoted, so spaces (common in
- *     temp dirs and `C:\Program Files`) and shell metacharacters survive.
+ *   - Exec form (`args`, Claude Code ≥ 2.1.139) spawns the executable directly
+ *     on every platform — no `sh`, Git Bash, PowerShell or cmd — so spaces,
+ *     quotes, `$`, backticks and `%` in either path are never interpreted.
+ *   - `command` is the current Node binary, a real executable on Windows too,
+ *     instead of `cat`.
+ *   - The sentinel path is passed hex-encoded: exec form still substitutes
+ *     `${CLAUDE_PROJECT_DIR}`-style placeholders inside `args`, and hex cannot
+ *     contain one.
  *
  * The hook JSON arrives on stdin and is copied into the sentinel; the watcher
  * only needs the file to change.
  */
-export function buildPostCompactHookCommand(
+export function buildPostCompactHook(
   compactPath: string,
-  platform: NodeJS.Platform = process.platform,
   nodePath: string = process.execPath,
-): string {
-  // No double quotes, `$` or backticks, so the script is inert in both quoting styles.
-  const script = "const f=require('fs');let d='';try{d=f.readFileSync(0)}catch{}f.writeFileSync(process.argv[1],d.length?d:'compact')";
-  if (platform === 'win32') {
-    // Windows paths cannot contain `"`, so double quotes are safe for cmd and Git Bash.
-    return `"${nodePath}" -e "${script}" "${compactPath}"`;
-  }
-  // POSIX: close the single-quoted string, append an escaped quote, reopen.
-  const quote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
-  return `${quote(nodePath)} -e ${quote(script)} ${quote(compactPath)}`;
+): ExecCommandHook {
+  const script = "const f=require('fs');let d='';try{d=f.readFileSync(0)}catch{}"
+    + "f.writeFileSync(Buffer.from(process.argv[1],'hex').toString(),d.length?d:'compact')";
+  return { type: 'command', command: nodePath, args: ['-e', script, Buffer.from(compactPath).toString('hex')] };
 }
 
 /**
@@ -103,7 +107,7 @@ export function createHookBridge(options?: HookBridgeOptions): PtyHookBridge {
     const stopCommand = `cat > ${sentinelPath}`;
 
     const hooks: Record<string, unknown> = {
-      PostCompact: [{ matcher: 'manual', hooks: [{ type: 'command', command: buildPostCompactHookCommand(compactPath) }] }],
+      PostCompact: [{ matcher: 'manual', hooks: [buildPostCompactHook(compactPath)] }],
       Stop: [
         {
           hooks: [{ type: 'command', command: stopCommand }],
