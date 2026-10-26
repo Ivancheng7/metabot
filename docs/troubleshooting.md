@@ -108,7 +108,7 @@ metabot doctor
 For a reproducible rollback, install a known release explicitly:
 
 ```bash
-metabot update --package --version 1.3.3
+metabot update --package --version 1.3.4
 ```
 
 Updates preserve `.env`, `bots.json`, `data/`, `logs/`, `~/.metabot/`, and

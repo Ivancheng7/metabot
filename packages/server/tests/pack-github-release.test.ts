@@ -60,12 +60,14 @@ describe('GitHub release package', () => {
     );
     expect(manifest).toMatchObject({
       package: 'metabot-personal-edition',
-      version: '1.3.3',
+      version: '1.3.4',
       includesCore: true,
       includesWebUi: true,
     });
 
     const packageJson = JSON.parse(execSync(`tar xOf ${JSON.stringify(TARBALL)} package.json`, { encoding: 'utf-8' }));
+    expect(packageJson.version).toBe('1.3.4');
+    expect(manifest.version).toBe(packageJson.version);
     expect(packageJson.workspaces).toContain('packages/server');
     expect(packageJson.workspaces).toContain('packages/web-ui');
     expect(packageJson.metabotEdition).toBe('personal');

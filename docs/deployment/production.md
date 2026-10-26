@@ -92,7 +92,7 @@ updates require coordinated preparation. No database migration is involved.
 
 ```bash
 metabot update                                  # latest verified release
-metabot update --package --version 1.3.3        # known immutable release
+metabot update --package --version 1.3.4        # known immutable release
 metabot doctor
 ```
 

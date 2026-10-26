@@ -4,11 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-10-26
+
 ### Added
 
 - Added authorized Agent Bus session listing/history, readable titles, targeted sends, and non-chaining result notices back to the sender session. Child-direct transport delivery now requires explicit opt-in.
 - Added Agent → Bus session navigation, session composers, and poll-safe history pagination to the self-hosted Console.
 - Added explicitly authorized, goal-driven Feishu/Lark `/auto`, native session names in `/resume`, Codex effort/service-tier selection, and Kimi K3.1 Pro/highspeed model choices.
+- Added native `/append` and `/steer` mid-turn input for Codex app-server and Claude Code PTY, with turn-bound ownership and serialized composer writes (#427).
+- Added native `/compact` for idle Codex and Claude Code PTY sessions, preserving session identity and waiting for explicit completion signals (#428).
+
+### Changed
+
+- Added GPT 6.1 Sol as the Codex fallback while preserving explicit and local model configuration.
 
 ### Fixed
 
