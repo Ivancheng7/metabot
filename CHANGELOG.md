@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Added authorized Agent Bus session listing/history, readable titles, targeted sends, and non-chaining result notices back to the sender session. Child-direct transport delivery now requires explicit opt-in.
+- Added Agent → Bus session navigation, session composers, and poll-safe history pagination to the self-hosted Console.
+- Added explicitly authorized, goal-driven Feishu/Lark `/auto`, native session names in `/resume`, Codex effort/service-tier selection, and Kimi K3.1 Pro/highspeed model choices.
+
+### Fixed
+
+- Kept virtual API/team rooms from emitting transport cards and retried result notices while their origin session is busy.
+- Isolated Unix installation/update Node selection from agent-private runtimes and verified native SQLite/PTY bindings before restart.
+- Updated axios to 1.20.0, protobufjs to 7.6.6, and DOMPurify to 3.4.17 while preserving self-hosted authentication and public integration defaults.
+
 ## [1.3.3] - 2026-10-25
 
 ### Added

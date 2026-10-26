@@ -48,6 +48,7 @@ export function startAppServerRun(input: {
   model?: string;
   contextWindow?: number;
   effort?: string;
+  serviceTier?: 'fast' | 'flex' | 'default';
   approvalPolicy: string;
   sandbox: string;
   signal: AbortSignal;
@@ -203,6 +204,7 @@ export function startAppServerRun(input: {
       emit({ type: 'thread.started', thread_id: threadId });
       const started = await request<{ turn: { id: string } }>('turn/start', {
         threadId, input: [{ type: 'text', text: input.prompt }], effort: input.effort,
+        ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
       });
       turnId = started.turn.id;
     })().catch(err => finish(err instanceof Error ? err.message : String(err)));

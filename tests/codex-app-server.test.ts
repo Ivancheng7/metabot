@@ -12,7 +12,7 @@ afterEach(() => {
   for (const run of runs.splice(0)) run.finish();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
-function start(scenario = '') {
+function start(scenario = '', serviceTier?: 'fast' | 'flex' | 'default') {
   const dir = mkdtempSync(join(tmpdir(), 'codex-rpc-'));
   dirs.push(dir);
   const log = join(dir, 'rpc.jsonl');
@@ -21,6 +21,7 @@ function start(scenario = '') {
     command: process.execPath, args: [resolve('tests/fixtures/codex-app-server.mjs')],
     env: { ...process.env, SCENARIO: scenario, RPC_LOG: log }, cwd: dir,
     prompt: 'initial', sessionId: 'test-thread', model: 'test-model',
+    serviceTier,
     approvalPolicy: 'never', sandbox: 'read-only', signal: controller.signal,
     logger: createLogger('silent'),
   });
@@ -31,6 +32,14 @@ function start(scenario = '') {
 }
 
 describe('Codex app-server native controls', () => {
+  it('passes the selected service tier to the native turn without replacing its model', async () => {
+    const ctx = start('', 'fast');
+    await vi.waitFor(() => expect(ctx.run.canSteer()).toBe(true));
+    expect(ctx.requests().find(request => request.method === 'turn/start').params.serviceTier).toBe('fast');
+    await ctx.run.steer('finish');
+    await ctx.drained;
+  });
+
   it('steers the current turn with an exact turn precondition and ignores unrelated threads', async () => {
     const ctx = start();
     await vi.waitFor(() => expect(ctx.run.canSteer()).toBe(true));

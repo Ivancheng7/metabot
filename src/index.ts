@@ -117,6 +117,7 @@ async function startFeishuBot(
     path.join(process.env.SESSION_STORE_DIR || path.join(os.homedir(), '.metabot'), 'feishu-turns', botConfig.name),
   ), botLogger);
   const bridge = new MessageBridge(botConfig, botLogger, sender);
+  bridge.setShadowTargetOpenId(botOpenId);
 
   // Create event dispatcher wired to the bridge
   const dispatcher = createEventDispatcher(

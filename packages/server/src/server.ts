@@ -267,6 +267,7 @@ async function deliverChatRunToAgent(
     engine?: string | null;
     model?: string | null;
     presentation?: ChatRunPresentation | null;
+    notification?: 'result' | 'error';
   },
 ): Promise<void> {
   const agent = agentStore.getByName(run.targetAgentRef);
@@ -286,6 +287,7 @@ async function deliverChatRunToAgent(
       eventCallbackUrl: `${corePublicBaseUrl()}/api/chat/runs/${encodeURIComponent(run.id)}/events`,
       userId: 'metabot-core-chat',
       ...(run.presentation ? { presentation: run.presentation } : {}),
+      ...(run.notification ? { notification: run.notification } : {}),
     };
     const message = inboxStore.enqueue({
       targetBot: run.targetAgentRef,
@@ -391,6 +393,7 @@ function isWebReadableRoute(method: string, pathname: string): boolean {
   if (pathname === '/api/chat/participants/search') return true;
   if (pathname === '/api/chat/conversations') return true;
   if (pathname.startsWith('/api/chat/conversations/')) return true;
+  if (pathname === '/api/messages/sessions' || pathname === '/api/messages/history') return true;
   if (pathname.startsWith('/api/chat/runs/')) return true;
   if (pathname === '/api/whoami') return true;
   if (pathname === '/api/t5t/board') return true;
@@ -414,6 +417,7 @@ function isWebWritableRoute(method: string, pathname: string): boolean {
   if (pathname === '/api/chat/conversations/agent-dm' && method === 'POST') return true;
   if (pathname === '/api/chat/conversations/user-dm' && method === 'POST') return true;
   if (pathname === '/api/chat/voice/transcribe' && method === 'POST') return true;
+  if (pathname === '/api/messages' && method === 'POST') return true;
   if (/^\/api\/chat\/conversations\/[^/]+\/(messages|participants|read)$/.test(pathname) && method === 'POST') {
     return true;
   }
@@ -591,6 +595,7 @@ export function startServer(options: ServerOptions): ServerHandle {
       engine?: string | null;
       model?: string | null;
       presentation?: ChatRunPresentation | null;
+      notification?: 'result' | 'error';
     }) => {
       void deliverChatRunToAgent(agentStore, inboxStore, logger, run);
     },
@@ -601,7 +606,14 @@ export function startServer(options: ServerOptions): ServerHandle {
       toolUseId?: string;
       answer?: string;
     }) => deliverChatControlToAgent(inboxStore, logger, control),
-    onRunEvent: (run: ChatRun, event: ChatRunEvent) => deliverChatRunProjectionToOrigin(inboxStore, logger, run, event),
+    onRunEvent: (run: ChatRun, event: ChatRunEvent): void => {
+      deliverChatRunProjectionToOrigin(inboxStore, logger, run, event);
+      try {
+        messageRoutes.deliverRunResultToSenderSession(messageDeps, run, event);
+      } catch (err) {
+        logger.warn({ err, runId: run.id }, 'run-result return to sender session failed');
+      }
+    },
   };
   const messageDeps = {
     agents: agentStore,
@@ -968,6 +980,12 @@ export function startServer(options: ServerOptions): ServerHandle {
         const ref = query.get('agentId') || query.get('agent') || '';
         return jsonResult(res, messageRoutes.listSessions(messageDeps, ref, query, cred));
       }
+      if (pathname === '/api/messages/history' && method === 'GET') {
+        return jsonResult(
+          res,
+          messageRoutes.listSessionMessages(messageDeps, query.get('sessionId') || '', query, cred),
+        );
+      }
       const messageAckMatch = pathname.match(/^\/api\/messages\/([^/]+)\/ack$/);
       if (messageAckMatch && method === 'POST') {
         return jsonResult(res, messageRoutes.ackMessage(messageDeps, decodeURIComponent(messageAckMatch[1]), cred));
@@ -979,16 +997,20 @@ export function startServer(options: ServerOptions): ServerHandle {
       }
       const agentSessionsMatch = pathname.match(/^\/api\/agents\/([^/]+)\/sessions$/);
       if (agentSessionsMatch && method === 'GET') {
-        return jsonResult(
-          res,
-          agentRoutes.listAgentSessions(
-            agentStore,
-            messageStore,
-            decodeURIComponent(agentSessionsMatch[1]),
-            query,
-            cred,
-          ),
+        const scoped = messageRoutes.listSessions(messageDeps, decodeURIComponent(agentSessionsMatch[1]), query, cred);
+        if (scoped.status !== 200) return jsonResult(res, scoped);
+        const pagination = scoped.body as { limit: number; offset: number };
+        const original = agentRoutes.listAgentSessions(
+          agentStore,
+          messageStore,
+          decodeURIComponent(agentSessionsMatch[1]),
+          new URLSearchParams({ limit: String(pagination.limit), offset: String(pagination.offset) }),
+          cred,
         );
+        return jsonResult(res, {
+          status: 200,
+          body: { ...(original.body as Record<string, unknown>), ...(scoped.body as Record<string, unknown>) },
+        });
       }
       if (pathname === '/api/agents/search' && method === 'GET') {
         return jsonResult(res, agentRoutes.searchAgents(agentStore, query, cred));

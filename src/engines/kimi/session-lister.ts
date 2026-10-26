@@ -34,6 +34,7 @@ export async function listKimiSessions(opts: {
       .slice(0, limit)
       .map((session) => ({
         sessionId: session.id,
+        name: session.title?.trim() || undefined,
         preview: truncatePreview(session.last_prompt || session.title || '', previewMaxLen) || '(no preview)',
         lastActive: Date.parse(session.updated_at) || 0,
         // Kimi's Server API intentionally abstracts its storage layout. The

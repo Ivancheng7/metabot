@@ -432,6 +432,8 @@ fi
 step "Phase 3: Installing dependencies"
 
 cd "$METABOT_HOME"
+source "$METABOT_HOME/scripts/node-runtime.sh"
+metabot_select_node "$METABOT_HOME"
 # Private bridge hosts only need:
 #   - root bridge runtime + devDeps (tsx for PM2, tsc for build, vitest)
 #   - @xvirobotics/cli + cli-core + metamemory + skill-hub (the four thin CLI
@@ -453,6 +455,7 @@ else
     --include-workspace-root
   success "npm dependencies installed (CLI workspaces, no server/web-ui)"
 fi
+metabot_verify_native "$METABOT_HOME"
 
 # Helper: npm install -g with sudo fallback
 npm_install_global() {
@@ -1450,7 +1453,7 @@ if pm2 describe metabot &>/dev/null 2>&1; then
   pm2 delete metabot 2>/dev/null || true
 fi
 info "Starting MetaBot with PM2..."
-pm2 start ecosystem.config.cjs
+pm2 start ecosystem.config.cjs --interpreter "$METABOT_NODE_PATH"
 
 pm2 save --force 2>/dev/null || true
 success "MetaBot is running!"

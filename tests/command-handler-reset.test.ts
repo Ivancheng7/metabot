@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { CommandHandler } from '../src/bridge/command-handler.js';
 import type { IncomingMessage } from '../src/types.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { vi } from 'vitest';
+import { SessionManager } from '../src/engines/claude/session-manager.js';
 
 interface RecordedNotice {
   chatId: string;
@@ -12,6 +17,8 @@ interface RecordedNotice {
 interface HandlerOpts {
   hasRunningTask?: boolean;
   queueDepth?: number;
+  activeGoal?: string;
+  sessionManager?: SessionManager;
 }
 
 function buildHandler(opts: HandlerOpts = {}) {
@@ -21,6 +28,8 @@ function buildHandler(opts: HandlerOpts = {}) {
   let resetSessionCalls = 0;
   let releaseExecutorCalls = 0;
   let queueDepth = opts.queueDepth ?? 0;
+  let activeGoal = opts.activeGoal;
+  const setGoalCalls: Array<string | undefined> = [];
 
   const sender = {
     sendCard: async () => undefined,
@@ -40,7 +49,14 @@ function buildHandler(opts: HandlerOpts = {}) {
     { name: 'test-bot' } as any,
     { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } as any,
     sender as any,
-    { resetSession: () => { resetSessionCalls++; } } as any,
+    opts.sessionManager ?? {
+      resetSession: () => { resetSessionCalls++; activeGoal = undefined; },
+      getSession: () => ({ activeGoal }),
+      setGoal: (_chatId: string, condition: string | undefined) => {
+        setGoalCalls.push(condition);
+        activeGoal = condition;
+      },
+    } as any,
     {} as any,
     audit,
     () => (opts.hasRunningTask ? { startTime: Date.now() - 1000 } : undefined),
@@ -60,6 +76,8 @@ function buildHandler(opts: HandlerOpts = {}) {
     handler,
     notices,
     counters: () => ({ stopTaskCalls, clearQueueCalls, resetSessionCalls, releaseExecutorCalls }),
+    setGoalCalls,
+    activeGoal: () => activeGoal,
   };
 }
 
@@ -76,6 +94,46 @@ function resetMessage(command = '/reset'): IncomingMessage {
 }
 
 describe('CommandHandler /reset', () => {
+  it.each(['/reset', '/new'])('%s clears real persisted goal state without changing cwd', async (command) => {
+    const storeDir = mkdtempSync(join(tmpdir(), 'metabot-command-reset-'));
+    const workingDirectory = mkdtempSync(join(tmpdir(), 'metabot-reset-cwd-'));
+    vi.stubEnv('SESSION_STORE_DIR', storeDir);
+    const manager = new SessionManager(storeDir, { info: vi.fn(), warn: vi.fn(), debug: vi.fn() } as any);
+    try {
+      manager.setSessionId('c1', 'previous', 'codex');
+      manager.setGoal('c1', 'finish the release');
+      manager.getSession('c1').workingDirectory = workingDirectory;
+      const kit = buildHandler({ sessionManager: manager });
+      expect(await kit.handler.handle(resetMessage(command))).toBe(true);
+      expect(manager.getSession('c1')).toMatchObject({
+        sessionId: undefined, activeGoal: undefined, goalSetAt: undefined,
+        goalIterations: undefined, goalMaxIterations: undefined, workingDirectory,
+      });
+      expect(kit.notices[0].content).toContain('active /goal cleared');
+    } finally {
+      manager.destroy();
+      vi.unstubAllEnvs();
+      rmSync(storeDir, { recursive: true, force: true });
+      rmSync(workingDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['/reset', '/new'])('%s explicitly clears an active goal', async (command) => {
+    const kit = buildHandler({ activeGoal: 'finish the release' });
+    expect(await kit.handler.handle(resetMessage(command))).toBe(true);
+    expect(kit.setGoalCalls).toEqual([]);
+    expect(kit.activeGoal()).toBeUndefined();
+    expect(kit.notices[0].content).toContain('active /goal cleared');
+    expect(kit.notices[0].content).toContain('Working directory preserved');
+  });
+
+  it('does not clear absent goals', async () => {
+    const kit = buildHandler();
+    await kit.handler.handle(resetMessage());
+    expect(kit.setGoalCalls).toEqual([]);
+    expect(kit.notices[0].content).not.toContain('active /goal');
+  });
+
   it('aborts a running task, clears queued messages, resets session, and releases executor', async () => {
     const { handler, notices, counters } = buildHandler({ hasRunningTask: true, queueDepth: 2 });
 
@@ -117,5 +175,36 @@ describe('CommandHandler /reset', () => {
     });
     expect(notices).toHaveLength(1);
     expect(notices[0].title).toContain('Session Reset');
+  });
+});
+
+describe('SessionManager internal resets', () => {
+  it('preserves OSS goal-clearing behavior, cwd and thread-context bookkeeping', () => {
+    const storeDir = mkdtempSync(join(tmpdir(), 'metabot-reset-goal-'));
+    vi.stubEnv('SESSION_STORE_DIR', storeDir);
+    const manager = new SessionManager(storeDir, { info: vi.fn(), warn: vi.fn(), debug: vi.fn() } as any);
+    try {
+      manager.setSessionId('c1', 'previous', 'codex');
+      manager.setGoal('c1', 'finish the release');
+      manager.addUsage('c1', 100, 1, 50);
+      manager.resetSession('c1');
+      expect(manager.getSession('c1')).toMatchObject({
+        sessionId: undefined,
+        sessionIdEngine: undefined,
+        activeGoal: undefined,
+        goalSetAt: undefined,
+        goalIterations: undefined,
+        goalMaxIterations: undefined,
+        workingDirectory: storeDir,
+        threadContextInitialized: true,
+        cumulativeTokens: 0,
+        cumulativeCostUsd: 0,
+        cumulativeDurationMs: 0,
+      });
+    } finally {
+      manager.destroy();
+      vi.unstubAllEnvs();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
   });
 });

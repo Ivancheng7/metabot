@@ -49,6 +49,9 @@ describe('GitHub release package', () => {
     expect(listing).toContain('ecosystem.core.config.cjs');
     expect(listing).toContain('packages/server/package.json');
     expect(listing).toContain('packages/web-ui/package.json');
+    expect(listing).toContain('scripts/node-runtime.sh');
+    expect(listing).toContain('scripts/check-native.cjs');
+    expect(listing).toContain('scripts/with-system-node.sh');
     expect(listing).not.toContain('packages/server/static/');
     expect(listing).not.toMatch(/(^|\n)\.?\/?web\//);
 

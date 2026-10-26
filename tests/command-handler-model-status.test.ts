@@ -2,9 +2,13 @@
  * Tests for CommandHandler /status, /model, /memory, /sync commands,
  * plus edge cases: unknown slash commands, empty input, unicode, very long input.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { CommandHandler } from '../src/bridge/command-handler.js';
 import type { IncomingMessage } from '../src/types.js';
+import { SessionManager } from '../src/engines/claude/session-manager.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 interface RecordedNotice {
   chatId: string;
@@ -20,6 +24,10 @@ interface BuildOpts {
   hasRunningTask?: boolean;
   memoryError?: boolean;
   docSyncConfigured?: boolean;
+  serviceTier?: 'fast' | 'flex' | 'default';
+  configServiceTier?: 'fast' | 'flex' | 'default';
+  kimiModel?: string;
+  handleAuto?: (message: IncomingMessage, args: string) => Promise<void>;
 }
 
 function buildHandler(opts: BuildOpts = {}) {
@@ -27,6 +35,8 @@ function buildHandler(opts: BuildOpts = {}) {
   let sessionEngine: string | undefined = opts.engine;
   let sessionModel: string | undefined = opts.sessionModel;
   let reasoningEffort: string | undefined;
+  let serviceTier = opts.serviceTier;
+  const releaseReasons: string[] = [];
 
   const sender = {
     sendCard: async () => undefined,
@@ -46,18 +56,26 @@ function buildHandler(opts: BuildOpts = {}) {
       engine: sessionEngine,
       model: sessionModel,
       reasoningEffort,
+      serviceTier,
       workingDirectory: '/workspace',
       sessionId: opts.sessionId,
     }),
     resetSession: () => {},
     setSessionEngine: (_chatId: string, engine: string | undefined) => {
+      if (sessionEngine === engine) return;
       sessionEngine = engine;
+      sessionModel = undefined;
+      reasoningEffort = undefined;
+      serviceTier = undefined;
     },
     setSessionModel: (_chatId: string, model: string | undefined) => {
       sessionModel = model;
     },
     setReasoningEffort: (_chatId: string, effort: string | undefined) => {
       reasoningEffort = effort;
+    },
+    setServiceTier: (_chatId: string, tier: 'fast' | 'flex' | 'default' | undefined) => {
+      serviceTier = tier;
     },
   } as any;
 
@@ -82,8 +100,8 @@ function buildHandler(opts: BuildOpts = {}) {
   const config = {
     name: 'test-bot',
     claude: { model: 'claude-opus-4-6' },
-    kimi: { model: 'kimi-code/k3' },
-    codex: { model: 'gpt-5.6', displayModel: 'gpt-5.6' },
+    kimi: { model: opts.kimiModel ?? 'kimi-code/k3' },
+    codex: { model: 'gpt-5.6', displayModel: 'gpt-5.6', serviceTier: opts.configServiceTier },
   } as any;
 
   const handler = new CommandHandler(
@@ -96,9 +114,10 @@ function buildHandler(opts: BuildOpts = {}) {
     () => (opts.hasRunningTask ? { startTime: Date.now() - 500 } : undefined),
     () => {},
     () => 0,
-    async () => {},
+    async (_chatId: string, reason: string) => { releaseReasons.push(reason); },
     () => [],
     async () => {},
+    opts.handleAuto,
   );
 
   if (opts.docSyncConfigured) {
@@ -115,6 +134,8 @@ function buildHandler(opts: BuildOpts = {}) {
     getSessionEngine: () => sessionEngine,
     getSessionModel: () => sessionModel,
     getReasoningEffort: () => reasoningEffort,
+    getServiceTier: () => serviceTier,
+    releaseReasons,
   };
 }
 
@@ -443,6 +464,162 @@ describe('CommandHandler /sync', () => {
 // =====================================================================
 // Edge cases
 // =====================================================================
+
+describe('CommandHandler model speed and combined options', () => {
+  it('enables Codex fast without changing the model or effort', async () => {
+    const kit = buildHandler({ engine: 'codex', sessionModel: 'gpt-5.5' });
+    await kit.handler.handle(msg('/effort high'));
+    await kit.handler.handle(msg('/model fast'));
+    expect(kit.getSessionModel()).toBe('gpt-5.5');
+    expect(kit.getReasoningEffort()).toBe('high');
+    expect(kit.getServiceTier()).toBe('fast');
+  });
+
+  it.each(['fast', 'flex', 'default'])('sets Codex model, effort and %s tier together', async (speed) => {
+    const kit = buildHandler({ engine: 'codex' });
+    await kit.handler.handle(msg(`/model gpt-6-astra | high | ${speed}`));
+    expect(kit.getSessionModel()).toBe('gpt-6-astra');
+    expect(kit.getReasoningEffort()).toBe('high');
+    expect(kit.getServiceTier()).toBe(speed);
+    expect(kit.notices[0].content).toContain(`speed \`${speed}\``);
+  });
+
+  it('clears empty effort and speed fields, but leaves omitted fields unchanged', async () => {
+    const kit = buildHandler({ engine: 'codex' });
+    await kit.handler.handle(msg('/model gpt-6-astra|ultra|fast'));
+    await kit.handler.handle(msg('/model gpt-5.5'));
+    expect(kit.getReasoningEffort()).toBe('ultra');
+    expect(kit.getServiceTier()).toBe('fast');
+    await kit.handler.handle(msg('/model gpt-5.5||'));
+    expect(kit.getReasoningEffort()).toBeUndefined();
+    expect(kit.getServiceTier()).toBe('default');
+  });
+
+  it.each([
+    'gpt-5.5|invalid|fast', 'gpt-5.5|high|invalid', 'gpt-5.5|high|fast|extra', '|high|fast',
+  ])('rejects invalid combined options atomically: %s', async (options) => {
+    const kit = buildHandler({ engine: 'codex', sessionModel: 'original', serviceTier: 'flex' });
+    await kit.handler.handle(msg('/effort low'));
+    await kit.handler.handle(msg(`/model ${options}`));
+    expect(kit.getSessionModel()).toBe('original');
+    expect(kit.getReasoningEffort()).toBe('low');
+    expect(kit.getServiceTier()).toBe('flex');
+    expect(kit.notices.at(-1)?.title).toContain('Invalid model options');
+  });
+
+  it.each(['claude', 'kimi'])('rejects pipe options on %s', async (engine) => {
+    const kit = buildHandler({ engine });
+    await kit.handler.handle(msg('/model some-model|high|fast'));
+    expect(kit.getSessionModel()).toBeUndefined();
+    expect(kit.notices[0].color).toBe('red');
+  });
+
+  it.each([
+    ['kimi-code/k3.1-pro', 'kimi-code/k3.1-pro-highspeed'],
+    ['k3.1-pro', 'kimi-code/k3.1-pro-highspeed'],
+    ['kimi-code/kimi-for-coding', 'kimi-code/kimi-for-coding-highspeed'],
+    ['kimi-for-coding', 'kimi-code/kimi-for-coding-highspeed'],
+    ['kimi-code/kimi-for-coding-highspeed', 'kimi-code/kimi-for-coding-highspeed'],
+    ['kimi-code/k3', 'kimi-code/k3.1-pro-highspeed'],
+  ])('maps Kimi fast from %s to %s', async (model, expected) => {
+    const kit = buildHandler({ engine: 'kimi', sessionModel: model });
+    await kit.handler.handle(msg('/model fast'));
+    expect(kit.getSessionModel()).toBe(expected);
+    expect(kit.getServiceTier()).toBeUndefined();
+  });
+
+  it('uses the configured Kimi model when selecting a highspeed variant', async () => {
+    const kit = buildHandler({ engine: 'kimi', kimiModel: 'kimi-code/kimi-for-coding' });
+    await kit.handler.handle(msg('/model fast'));
+    expect(kit.getSessionModel()).toBe('kimi-code/kimi-for-coding-highspeed');
+  });
+
+  it.each(['/model fast', '/model gpt-5.5|high|fast', '/model reset', '/model kimi'])('keeps the OSS busy guard for %s', async (command) => {
+    const kit = buildHandler({ engine: 'codex', hasRunningTask: true, sessionModel: 'original', serviceTier: 'flex' });
+    await kit.handler.handle(msg(command));
+    expect(kit.getSessionEngine()).toBe('codex');
+    expect(kit.getSessionModel()).toBe('original');
+    expect(kit.getServiceTier()).toBe('flex');
+    expect(kit.notices[0].title).toContain('Task In Progress');
+    expect(kit.releaseReasons).toEqual([]);
+  });
+
+  it('allows listing while busy and includes the new options', async () => {
+    const kit = buildHandler({ engine: 'codex', hasRunningTask: true });
+    await kit.handler.handle(msg('/model list'));
+    expect(kit.notices[0].content).toContain('gpt-6.1-sol');
+    expect(kit.notices[0].content).toContain('fast / flex');
+  });
+
+  it('includes K3.1 Pro, highspeed and 256K options', async () => {
+    const kit = buildHandler({ engine: 'kimi' });
+    await kit.handler.handle(msg('/model list'));
+    expect(kit.notices[0].content).toContain('kimi-code/k3.1-pro');
+    expect(kit.notices[0].content).toContain('kimi-code/k3.1-pro-highspeed');
+    expect(kit.notices[0].content).toContain('kimi-code/k3-256k');
+  });
+
+  it('clears service tier and releases the old executor on engine switch', async () => {
+    const kit = buildHandler({ engine: 'codex', serviceTier: 'fast' });
+    await kit.handler.handle(msg('/model kimi'));
+    expect(kit.getServiceTier()).toBeUndefined();
+    expect(kit.releaseReasons).toEqual(['engine-switch']);
+  });
+
+  it.each([undefined, 'flex'] as const)('resets service tier to bot default %s', async (configServiceTier) => {
+    const kit = buildHandler({ engine: 'codex', serviceTier: 'fast', configServiceTier });
+    await kit.handler.handle(msg('/model reset'));
+    expect(kit.getServiceTier()).toBe(configServiceTier ?? 'default');
+  });
+});
+
+describe('SessionManager service tier', () => {
+  it.each(['fast', 'flex', 'default'] as const)('persists standalone %s overrides and clears them on engine switch', (tier) => {
+    const storeDir = mkdtempSync(join(tmpdir(), 'metabot-tier-'));
+    vi.stubEnv('SESSION_STORE_DIR', storeDir);
+    const logger = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() } as any;
+    let manager = new SessionManager(storeDir, logger, 'tier');
+    try {
+      manager.setServiceTier('chat', tier);
+      manager.destroy();
+      manager = new SessionManager(storeDir, logger, 'tier');
+      expect(manager.getSession('chat').serviceTier).toBe(tier);
+      manager.setSessionEngine('chat', 'kimi');
+      expect(manager.getSession('chat').serviceTier).toBeUndefined();
+    } finally {
+      manager.destroy();
+      vi.unstubAllEnvs();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('CommandHandler /auto', () => {
+  it('routes goals, status and stop to the bridge without altering arguments', async () => {
+    const handleAuto = vi.fn(async () => {});
+    const kit = buildHandler({ handleAuto });
+    for (const args of ['Fix Tests', 'status', 'stop', '']) {
+      const incoming = msg(`/AUTO ${args}`);
+      expect(await kit.handler.handle(incoming)).toBe(true);
+      expect(handleAuto).toHaveBeenLastCalledWith(incoming, args);
+    }
+  });
+
+  it('reports unavailable when the channel has no Shadow handler', async () => {
+    const kit = buildHandler();
+    expect(await kit.handler.handle(msg('/auto goal'))).toBe(true);
+    expect(kit.notices[0]).toMatchObject({ color: 'red', content: 'Shadow Mode is unavailable on this channel.' });
+  });
+
+  it('retains community command help and aliases', async () => {
+    const kit = buildHandler();
+    expect(await kit.handler.handle(msg('/?'))).toBe(true);
+    const help = kit.notices[0].content;
+    for (const command of ['/new', '/steer', '/compact', '/auto [goal]', '/group-reply']) {
+      expect(help).toContain(command);
+    }
+  });
+});
 
 describe('CommandHandler edge cases', () => {
   it('returns false for non-slash messages (plain text)', async () => {

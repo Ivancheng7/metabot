@@ -563,6 +563,51 @@ describe('MessageBridge between-turn questions', () => {
 });
 
 describe('MessageBridge chatId cleanup (memory leak guard)', () => {
+  it('suppresses transport cards for virtual API rooms even when sendCards is requested', async () => {
+    const sender = makeSender();
+    const bridge = new MessageBridge(makeCodexConfig(), mockLogger, sender as any) as any;
+    bridge.runOneTurn = vi.fn(async () => ({
+      stream: (async function* () { yield { type: 'result', subtype: 'success', result: 'done', is_error: false }; })(),
+      finish() {}, sendAnswer() {}, resolveQuestion() {},
+    }));
+    try {
+      const result = await bridge.executeApiTask({ prompt: 'virtual task', chatId: 'team:public:worker', sendCards: true });
+      expect(result.success).toBe(true);
+      expect(sender.sent).toHaveLength(0);
+    } finally {
+      bridge.destroy();
+    }
+  });
+
+  it('requires explicit user authorization before invoking /auto', async () => {
+    const previous = process.env.METABOT_AUTO_ALLOWED_USER_IDS;
+    const sender = makeSender();
+    sender.sendTextNotice = vi.fn(async () => {});
+    const bridge = new MessageBridge(makeConfig(), mockLogger, sender as any) as any;
+    const activate = vi.spyOn(bridge.shadowMode, 'command').mockResolvedValue(undefined);
+    try {
+      delete process.env.METABOT_AUTO_ALLOWED_USER_IDS;
+      await bridge.handleMessage({ chatId: 'oc_auto', userId: 'unapproved', text: '/auto work', messageId: 'm-auto' });
+      expect(activate).not.toHaveBeenCalled();
+      expect(sender.sendTextNotice).toHaveBeenCalledWith('oc_auto', 'Shadow Mode unavailable', expect.stringContaining('METABOT_AUTO_ALLOWED_USER_IDS'), 'orange');
+    } finally {
+      if (previous === undefined) delete process.env.METABOT_AUTO_ALLOWED_USER_IDS;
+      else process.env.METABOT_AUTO_ALLOWED_USER_IDS = previous;
+      bridge.destroy();
+    }
+  });
+
+  it('never claims a notification was steered when its turn ended during submission', async () => {
+    const bridge = new MessageBridge(makeConfig(), mockLogger, makeSender() as any) as any;
+    bridge.isChatBusy = vi.fn(() => true);
+    const steer = vi.fn(async () => 'no-active-turn');
+    bridge.persistentRegistry = { peek: () => ({ canSteer: () => true, steer }), closeAll: vi.fn(), destroy: vi.fn() };
+    expect(await bridge.steerAgentNotification('oc_notice', 'notice')).toBe(false);
+    expect(steer).toHaveBeenCalledWith('notice');
+    bridge.persistentRegistry = undefined;
+    bridge.destroy();
+  });
+
   it('sweepStaleChatIdEntries evicts only entries older than the TTL', () => {
     const sender = makeSender();
     const bridge = new MessageBridge(makeConfig(), mockLogger, sender as any) as any;
