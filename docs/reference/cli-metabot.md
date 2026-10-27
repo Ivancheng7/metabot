@@ -20,7 +20,7 @@ Installed automatically by the MetaBot installer to `~/.local/bin/metabot`.
 ```bash
 metabot update                                  # package install: latest GitHub Release
 metabot update --package                        # force latest GitHub Release package
-metabot update --package --version 1.3.2        # pin immutable Release v1.3.2
+metabot update --package --version 1.3.4        # pin immutable Release v1.3.4
 metabot update --git                            # force git pull + rebuild + restart
 metabot start                       # start with PM2
 metabot stop                        # stop
@@ -36,7 +36,7 @@ For a normal package-managed personal edition, `metabot update` defaults to the
 latest GitHub Release. A source checkout is auto-detected and keeps its Git
 update path; use `--package` to force a Release overlay.
 
-`metabot update --package --version 1.3.2` selects the immutable v1.3.2 assets
+`metabot update --package --version 1.3.4` selects the immutable v1.3.4 assets
 instead of `latest`. Package updating performs:
 
 1. Download `install.sh`, `metabot-runtime.tgz`, and `SHA256SUMS` from the latest or pinned GitHub Release.
@@ -99,6 +99,38 @@ Core persists the message and logical run, resolves a usable target session,
 and returns `messageId`, `sessionId`, and `runId`. Set
 `--origin-chat <oc_...> --origin-bot <name>` when a Feishu-origin bridge should
 receive progress; use `--child-direct` to keep presentation in the target chat.
+
+#### Bus sessions and result returns
+
+```bash
+metabot send sessions <agentId> [--limit N] [--offset N]
+metabot send history <sessionId> [--limit N] [--before <messageId>]
+metabot send <agentId> "prompt" --session <sessionId> --sender-session <ownedSessionId>
+metabot send <agentId> "prompt" --child-direct
+```
+
+Session lists are scoped to agent owners and room participants before pagination;
+agent visibility is not permission to read or inject into another user's room.
+An untargeted send creates a separate context when no authorized session exists.
+History is chronological within each page (default 20, maximum 200), with
+`hasMore` and `oldestMessageId` for paging backward. Session titles derive from
+the first message (collapsed whitespace, at most 40 characters); existing
+custom titles are preserved. Ambiguous sends return candidate sessions for
+retrying with `--session`.
+
+`--sender-session` must identify an owned agent's session, with sender membership
+when it already has a room. Terminal results enqueue a normal Core run in that
+session: success notices carry an 800-character excerpt, errors retain their
+full failure detail, and both include a command to pull the full run events.
+Returns are deduplicated, do not chain, and skip same-room sends. A bound Feishu
+sender session receives its return child-direct; otherwise it stays in the Bus
+room. Result storage does not depend on the sender session being online.
+
+Target `--child-direct` presentation is opt-in; a stale transport binding alone
+never posts a card. `--implicit` suppresses target presentation, not an explicit
+`--sender-session` return. Origin-proxy runs retain their existing projection
+path without a duplicate session return. Legacy bridge projection/steering
+support is not supplied by these session APIs.
 
 ```bash
 metabot talk <bot> <chatId> <prompt>      # talk to a bot (bridge /api/talk)

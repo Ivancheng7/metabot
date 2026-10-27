@@ -242,11 +242,15 @@ export class SlashPickerController {
     }
 
     const options = sessions.map((s) => {
-      const rel = formatRelativeTime(s.lastActive);
+      const rel = formatRelativeTime(s.lastActive).replace(/^just now$/, 'now');
       const marker = s.isCurrent ? ' · current' : '';
+      const idPrefix = s.sessionId.slice(0, 8);
+      const name = truncateLabel(s.name || (s.preview && s.preview !== '(no preview)' ? s.preview : idPrefix), 48);
+      const detail =
+        s.name && s.preview && s.preview !== '(no preview)' && s.preview !== s.name ? ` · ${s.preview}` : '';
       return {
-        label: s.sessionId.slice(0, 8),
-        description: `${s.preview} · ${rel}${marker}`,
+        label: `${rel} · ${name}`,
+        description: `${idPrefix}${marker}${detail}`,
       };
     });
 
@@ -343,6 +347,11 @@ function normalizeCodexEffort(value: string): CodexReasoningEffort | 'reset' | u
     normalized === 'ultra'
   ) return normalized;
   return undefined;
+}
+
+function truncateLabel(value: string, maxLength = 60): string {
+  const collapsed = value.replace(/\s+/g, ' ').trim();
+  return collapsed.length > maxLength ? `${collapsed.slice(0, maxLength)}…` : collapsed;
 }
 
 export function formatRelativeTime(ms: number, now: number = Date.now()): string {

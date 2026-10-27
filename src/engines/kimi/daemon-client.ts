@@ -329,7 +329,7 @@ export class KimiDaemonClient {
       requested ||
       defaultModel ||
       aliases[0] ||
-      'kimi-code/k3';
+      'kimi-code/k3.1-pro';
     return { id, displayName: modelDisplayName(config, id) ?? id.split('/').at(-1) ?? id };
   }
 

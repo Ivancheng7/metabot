@@ -113,10 +113,54 @@ describe('handleCoreChatRoutes', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
     vi.clearAllMocks();
     __resetCoreChatRunsForTests();
+  });
+
+  it('steers result notifications into a busy turn without starting a second turn', async () => {
+    const bridge = {
+      isBusy: vi.fn(() => true),
+      steerAgentNotification: vi.fn(async () => true),
+      executeApiTask: vi.fn(), stopChatTask: vi.fn(),
+    };
+    await handleCoreChatRoutes(makeCtx(bridge), makeReq(runBody({ notification: 'result' })), makeRes(), 'POST', '/api/core-chat/runs');
+    await eventually(() => expect(vi.mocked(fetch).mock.calls.some(call => JSON.parse(call[1]?.body as string).type === 'complete')).toBe(true));
+    expect(bridge.steerAgentNotification).toHaveBeenCalledWith('core-conv-1-metabot', 'hello');
+    expect(bridge.executeApiTask).not.toHaveBeenCalled();
+  });
+
+  it('waits for an idle origin when a result notice cannot be steered', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    let busy = true;
+    const bridge = {
+      isBusy: vi.fn(() => busy),
+      steerAgentNotification: vi.fn(async () => false),
+      executeApiTask: vi.fn(async () => ({ success: true, responseText: 'done' })), stopChatTask: vi.fn(),
+    };
+    await handleCoreChatRoutes(makeCtx(bridge), makeReq(runBody({ notification: 'result' })), makeRes(), 'POST', '/api/core-chat/runs');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bridge.executeApiTask).not.toHaveBeenCalled();
+    busy = false;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(bridge.executeApiTask).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits rather than steering a full failure notice, and cancels pending delivery cleanly', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const bridge = {
+      isBusy: vi.fn(() => true), steerAgentNotification: vi.fn(),
+      executeApiTask: vi.fn(), stopChatTask: vi.fn(() => false),
+    };
+    const ctx = makeCtx(bridge);
+    await handleCoreChatRoutes(ctx, makeReq(runBody({ notification: 'error' })), makeRes(), 'POST', '/api/core-chat/runs');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bridge.steerAgentNotification).not.toHaveBeenCalled();
+    await handleCoreChatRoutes(ctx, makeReq({}), makeRes(), 'POST', '/api/core-chat/runs/run-1/cancel');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(bridge.executeApiTask).not.toHaveBeenCalled();
   });
 
   it('accepts a core-chat run and executes the bot with sendCards false', async () => {

@@ -25,6 +25,7 @@ export interface UserSession {
   modelEngine?: EngineName;
   /** Per-session Codex reasoning effort override. */
   reasoningEffort?: CodexReasoningEffort;
+  serviceTier?: 'fast' | 'flex' | 'default';
   /** Per-session engine override. Falls back to bot default when undefined. */
   engine?: EngineName;
   /**
@@ -53,6 +54,7 @@ interface PersistedSession {
   model?: string;
   modelEngine?: EngineName;
   reasoningEffort?: CodexReasoningEffort;
+  serviceTier?: 'fast' | 'flex' | 'default';
   engine?: EngineName;
   activeGoal?: string;
   goalSetAt?: number;
@@ -168,6 +170,12 @@ export class SessionManager {
     this.saveToDisk();
   }
 
+  setServiceTier(chatId: string, tier: 'fast' | 'flex' | 'default' | undefined): void {
+    const session = this.getSession(chatId);
+    session.serviceTier = tier;
+    this.saveToDisk();
+  }
+
   /**
    * Set per-session engine override. Pass undefined to clear and fall back
    * to the bot's configured engine. Switching engines also clears the prior
@@ -183,6 +191,7 @@ export class SessionManager {
     session.model = undefined;
     session.modelEngine = undefined;
     session.reasoningEffort = undefined;
+    session.serviceTier = undefined;
     this.logger.info({ chatId, engine }, 'Session engine override updated (session reset)');
     this.saveToDisk();
   }
@@ -284,7 +293,7 @@ export class SessionManager {
       const data: Record<string, PersistedSession> = {};
       for (const [chatId, session] of this.sessions) {
         // Persist sessions that have a sessionId, model, engine override, effort override, or active goal
-        if (session.sessionId || session.model || session.engine || session.reasoningEffort || session.activeGoal || session.threadContextInitialized) {
+        if (session.sessionId || session.model || session.engine || session.reasoningEffort || session.serviceTier || session.activeGoal || session.threadContextInitialized) {
           data[chatId] = {
             sessionId: session.sessionId || '',
             sessionIdEngine: session.sessionIdEngine,
@@ -297,6 +306,7 @@ export class SessionManager {
             model: session.model,
             modelEngine: session.modelEngine,
             reasoningEffort: session.reasoningEffort,
+            serviceTier: session.serviceTier,
             engine: session.engine,
             activeGoal: session.activeGoal,
             goalSetAt: session.goalSetAt,
@@ -333,6 +343,7 @@ export class SessionManager {
           model: persisted.model,
           modelEngine: persisted.modelEngine,
           reasoningEffort: persisted.reasoningEffort,
+          serviceTier: persisted.serviceTier,
           engine: persisted.engine,
           activeGoal: persisted.activeGoal,
           goalSetAt: persisted.goalSetAt,

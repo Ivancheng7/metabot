@@ -171,6 +171,8 @@ export interface VoiceReplyConfig {
 
 /** Codex-specific overrides. Populated only when engine === 'codex'. */
 export interface CodexBotConfig {
+  /** Opt in to native mid-turn steering via the Codex app-server. */
+  transport?: 'exec' | 'app-server';
   executable?: string;
   model?: string;
   displayModel?: string;
@@ -186,6 +188,7 @@ export interface CodexBotConfig {
   contextWindow?: number;
   /** Default reasoning effort for Codex CLI (`model_reasoning_effort`). */
   reasoningEffort?: CodexReasoningEffort;
+  serviceTier?: 'fast' | 'flex' | 'default';
   extraArgs?: string[];
   env?: Record<string, string>;
 }
@@ -300,6 +303,8 @@ export interface KimiJsonConfig {
 
 /** Codex-specific overrides in bots.json. */
 export interface CodexJsonConfig {
+  /** Opt in to native mid-turn steering via the Codex app-server. */
+  transport?: 'exec' | 'app-server';
   executable?: string;
   model?: string;
   displayModel?: string;
@@ -637,6 +642,7 @@ function buildClaudeConfig(entry: {
 
 function buildCodexConfig(entry?: CodexJsonConfig): BotConfigBase['codex'] | undefined {
   const envReasoningEffort = normalizeCodexReasoningEffort(process.env.CODEX_REASONING_EFFORT);
+  const envServiceTier = process.env.CODEX_SERVICE_TIER?.trim().toLowerCase();
   const cfg: BotConfigBase['codex'] = {
     ...(process.env.CODEX_EXECUTABLE_PATH ? { executable: process.env.CODEX_EXECUTABLE_PATH } : {}),
     ...(process.env.CODEX_MODEL ? { model: process.env.CODEX_MODEL } : {}),
@@ -657,6 +663,9 @@ function buildCodexConfig(entry?: CodexJsonConfig): BotConfigBase['codex'] | und
       : {}),
     ...(process.env.CODEX_CONTEXT_WINDOW ? { contextWindow: parseInt(process.env.CODEX_CONTEXT_WINDOW, 10) } : {}),
     ...(envReasoningEffort ? { reasoningEffort: envReasoningEffort } : {}),
+    ...(envServiceTier === 'fast' || envServiceTier === 'flex' || envServiceTier === 'default'
+      ? { serviceTier: envServiceTier }
+      : {}),
     ...(entry ?? {}),
   };
   return Object.keys(cfg).length > 0 ? cfg : undefined;
