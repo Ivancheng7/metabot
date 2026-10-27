@@ -157,7 +157,7 @@ describe.each<Route>(['talk', 'core'])('%s real bridge non-execution admission',
     const f = fixture(route);
     if (state === 'half-open') await f.halfOpen();
     const callsBefore = backend.start.mock.calls.length;
-    let release = () => {};
+    let release: () => void;
     if (refusal === 'busy') {
       const gate = await f.parkStart();
       f.pending.push(f.bridge.executeApiTask({ chatId: f.chatId, prompt: 'unrelated owner' }));
