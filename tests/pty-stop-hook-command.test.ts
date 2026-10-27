@@ -1,34 +1,28 @@
-import { describe, expect, it } from 'vitest';
-import { buildStopHookCommand } from '../src/engines/claude/pty/hook-bridge.js';
+import { rmSync } from 'node:fs';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { createHostileRuntime, runGeneratedHook } from './fixtures/pty-hook-test-utils.js';
 
-describe('buildStopHookCommand', () => {
-  it('uses a command that exists on the host OS', () => {
-    // `cat` is not available on Windows, where hooks run through cmd.
-    expect(buildStopHookCommand('/tmp/x/stop.flag', 'linux')).toBe("cat > '/tmp/x/stop.flag'");
-    expect(buildStopHookCommand('C:\\Temp\\stop.flag', 'win32')).toContain('powershell.exe');
-    expect(buildStopHookCommand('C:\\Temp\\stop.flag', 'win32')).not.toContain('cat >');
-  });
+let runtime: ReturnType<typeof createHostileRuntime>;
+beforeAll(() => { runtime = createHostileRuntime(); });
+afterAll(() => { rmSync(runtime.root, { recursive: true, force: true }); });
 
-  it('quotes the sentinel path so spaces and metacharacters survive', () => {
-    expect(buildStopHookCommand('/tmp/my dir/stop.flag', 'linux')).toBe("cat > '/tmp/my dir/stop.flag'");
-    expect(buildStopHookCommand('C:\\Temp Folder\\stop.flag', 'win32')).toContain(
-      "Set-Content -LiteralPath 'C:\\Temp Folder\\stop.flag'",
-    );
-  });
-
-  it('escapes a single quote in the path for each shell', () => {
-    // POSIX: close the quoted string, emit an escaped quote, reopen it.
-    expect(buildStopHookCommand("/tmp/it's/stop.flag", 'linux')).toBe(
-      `cat > '/tmp/it'"'"'s/stop.flag'`,
-    );
-    // PowerShell: a single quote is escaped by doubling it.
-    expect(buildStopHookCommand("C:\\it's\\stop.flag", 'win32')).toContain(
-      "Set-Content -LiteralPath 'C:\\it''s\\stop.flag'",
-    );
-  });
-
-  it('defaults to the host platform', () => {
-    const expected = process.platform === 'win32' ? 'powershell.exe' : 'cat >';
-    expect(buildStopHookCommand('/tmp/stop.flag')).toContain(expected);
-  });
+describe('Stop hook', () => {
+  it.each([
+    JSON.stringify({ hook_event_name: 'Stop', stop_hook_active: false, last_assistant_message: 'done $ ` ${literal}' }),
+    '',
+  ])('executes generated settings at literal hostile executable and temp paths with stdin %j', async payload => {
+    expect(await runGeneratedHook(runtime, 'Stop', payload)).toEqual({
+      code: 0,
+      error: null,
+      stderr: '',
+      execForm: true,
+      command: runtime.nodePath,
+      opaquePath: true,
+      payload: payload || 'stop',
+      turns: 1,
+      compactions: 0,
+      injectedFile: false,
+      manualCompact: 'manual',
+    });
+  }, 30000);
 });
