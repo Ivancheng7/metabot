@@ -116,13 +116,29 @@ export class MessageStore {
 
   listSessions(
     agentId: string,
-    options: { limit?: number; offset?: number; statuses?: MessageSessionStatus[] } = {},
+    options: {
+      limit?: number;
+      offset?: number;
+      statuses?: MessageSessionStatus[];
+      participantRef?: string;
+      agentRef?: string;
+    } = {},
   ): { sessions: MessageSession[]; total: number } {
     const limit = Math.max(1, Math.min(100, options.limit ?? 20));
     const offset = Math.max(0, options.offset ?? 0);
     const statuses = options.statuses ?? [];
-    const where = `agent_id = ?${statuses.length ? ` AND status IN (${statuses.map(() => '?').join(',')})` : ''}`;
+    const where = `agent_id = ?${statuses.length ? ` AND status IN (${statuses.map(() => '?').join(',')})` : ''}${
+      options.participantRef !== undefined
+        ? " AND room_id IN (SELECT conversation_id FROM chat_participants WHERE kind = 'user' AND ref = ?)"
+        : ''
+    }${
+      options.agentRef !== undefined
+        ? " AND (room_id IS NULL OR room_id IN (SELECT conversation_id FROM chat_participants WHERE kind = 'agent' AND ref = ?))"
+        : ''
+    }`;
     const params = [agentId, ...statuses];
+    if (options.participantRef !== undefined) params.push(options.participantRef);
+    if (options.agentRef !== undefined) params.push(options.agentRef);
     const total = Number(
       (this.db.prepare(`SELECT COUNT(*) AS n FROM message_sessions WHERE ${where}`).get(...params) as { n: number }).n,
     );
@@ -195,6 +211,11 @@ export class MessageStore {
       provider_session_id = COALESCE(?, provider_session_id), updated_at = ?, last_seen_at = ? WHERE id = ?`,
       )
       .run(status ?? null, providerSessionId ?? null, now, now, id);
+    return this.getSession(id);
+  }
+
+  setSessionTitle(id: string, title: string): MessageSession | null {
+    this.db.prepare('UPDATE message_sessions SET title = ? WHERE id = ?').run(title, id);
     return this.getSession(id);
   }
 

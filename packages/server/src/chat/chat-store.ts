@@ -203,7 +203,10 @@ export class ChatStore {
     try {
       this.events.emit('chat', event);
     } catch (err) {
-      this.logger.warn({ err, type: event.type, conversationId: event.conversationId }, 'chat live event listener threw');
+      this.logger.warn(
+        { err, type: event.type, conversationId: event.conversationId },
+        'chat live event listener threw',
+      );
     }
   }
 
@@ -596,6 +599,10 @@ export class ChatStore {
     options: { limit?: number; before?: string } = {},
   ): ChatMessage[] {
     this.assertParticipant(conversationId, 'user', userRef);
+    return this.peekMessages(conversationId, options);
+  }
+
+  peekMessages(conversationId: string, options: { limit?: number; before?: string } = {}): ChatMessage[] {
     const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
     const before = options.before;
     const rows = before
@@ -622,6 +629,27 @@ export class ChatStore {
           )
           .all(conversationId, limit) as RawMessageRow[]);
     return rows.map(rowToMessage).reverse();
+  }
+
+  firstMessageContent(conversationId: string): string | null {
+    const row = this.db
+      .prepare('SELECT content FROM chat_messages WHERE conversation_id = ? ORDER BY rowid ASC LIMIT 1')
+      .get(conversationId) as { content: string } | undefined;
+    return row?.content ?? null;
+  }
+
+  hasParticipant(conversationId: string, kind: ChatParticipantKind, ref: string): boolean {
+    return this.getParticipant(conversationId, kind, normalizeRef(kind, ref)) !== null;
+  }
+
+  ensureParticipantUnchecked(conversationId: string, participant: { kind: ChatParticipantKind; ref: string }): void {
+    const ref = normalizeRef(participant.kind, participant.ref);
+    if (!ref.trim()) return;
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO chat_participants (conversation_id, kind, ref, display_name, added_by, added_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(conversationId, participant.kind, ref, ref, ref, new Date().toISOString());
   }
 
   markRead(conversationId: string, userRef: string, messageId: string | null): ChatReadState {
@@ -803,7 +831,9 @@ export class ChatStore {
         if (message) this.emitLive({ type: 'message.created', conversationId: updatedRun.conversationId, message });
       }
       if (event.kind === 'file') {
-        const rows = this.db.prepare('SELECT * FROM chat_files WHERE run_id = ? ORDER BY created_at ASC, id ASC').all(updatedRun.id) as RawFileRow[];
+        const rows = this.db
+          .prepare('SELECT * FROM chat_files WHERE run_id = ? ORDER BY created_at ASC, id ASC')
+          .all(updatedRun.id) as RawFileRow[];
         for (const row of rows) {
           const file = rowToFile(row);
           this.emitLive({ type: 'file.created', conversationId: updatedRun.conversationId, file });

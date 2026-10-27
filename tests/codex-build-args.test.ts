@@ -15,6 +15,21 @@ describe('buildCodexArgs', () => {
   const cwd = '/work/proj';
   const prompt = 'run pwd';
 
+  it('keeps the model and effort when overriding an inherited fast tier', () => {
+    const args = buildCodexArgs({ serviceTier: 'fast' }, cwd, prompt, undefined, 'gpt-6.1-sol', 'medium', 'default');
+    expect(args).toContain('gpt-6.1-sol');
+    expect(args).toContain('model_reasoning_effort="medium"');
+    expect(args).toContain('service_tier="default"');
+    expect(args).not.toContain('service_tier="fast"');
+  });
+
+  it('passes a configured fast tier without changing approval or sandbox defaults', () => {
+    const args = buildCodexArgs({ serviceTier: 'fast' }, cwd, prompt, undefined, 'custom-model');
+    expect(args.slice(0, 4)).toEqual(['-a', 'never', '--sandbox', 'workspace-write']);
+    expect(args).toContain('custom-model');
+    expect(args).toContain('service_tier="fast"');
+  });
+
   it('defaults approval policy to "never" and sandbox to "workspace-write"', () => {
     const args = buildCodexArgs({}, cwd, prompt, undefined, undefined);
     expect(args).toEqual([
@@ -128,6 +143,20 @@ describe('buildCodexArgs', () => {
     } finally {
       if (priorCodexHome === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = priorCodexHome;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses GPT 6.1 Sol only when no explicit or local model is configured', () => {
+    const previous = process.env.CODEX_HOME;
+    const dir = mkdtempSync(join(tmpdir(), 'metabot-codex-default-'));
+    try {
+      process.env.CODEX_HOME = dir;
+      expect(resolveCodexModelMetadata({}).model).toBe('gpt-6.1-sol');
+      expect(resolveCodexModelMetadata({ model: 'user-model' }).model).toBe('user-model');
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previous;
       rmSync(dir, { recursive: true, force: true });
     }
   });

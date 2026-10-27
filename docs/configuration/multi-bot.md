@@ -93,9 +93,44 @@ Common fields are `model`, `profile`, `apiKey`, `baseUrl`, `reasoningEffort`,
 `approvalPolicy`, `sandbox`, `executable`, `extraArgs`, and `env`. Normal
 subscription use only needs `codex login`.
 
-The public adapter currently runs `codex exec --json` and resumes with
-`codex exec resume`. Codex app-server and native mid-turn steering are not part
-of the current public behavior.
+The default transport runs `codex exec --json` and resumes with `codex exec resume`.
+Set `codex.transport` to `"app-server"` and restart MetaBot to opt in to native
+mid-turn steering. This uses the installed Codex CLI's stdio app-server and
+preserves the configured model, profile, environment, sandbox and approval policy.
+
+While a Codex task is running, send `/append <instructions>` (alias
+`/steer <instructions>`) to add text to the active turn. In a Feishu group using
+mention mode, address the command to the bot. The command acknowledges Codex's
+acceptance; application happens at an execution boundary and cannot undo work
+already performed. Ordinary messages still queue for the next turn. Idle,
+starting, completed, or rejected turns report a notice rather than starting a
+new task or silently queueing the steering text.
+
+This opt-in transport handles text responses, command events, token usage and
+blocking user questions. Interactive command/file approval requests are declined;
+other unsupported server requests return an explicit error. It does not grant
+permissions beyond the configured policy. Use a Codex CLI with
+[app-server turn/steer support](https://developers.openai.com/codex/app-server/);
+native integration was verified with CLI `0.163.0-alpha.11.1`.
+
+### Manual compaction
+
+Send `/compact` while a Codex conversation is idle to compact its history without
+resetting the session. The bridge temporarily starts the installed CLI's
+app-server, resumes the existing thread, and calls `thread/compact/start`.
+Normal turns continue to use `codex exec`; no transport configuration change is
+required. The bridge waits for a completed compaction item and successful turn,
+rather than treating the initial RPC acknowledgement as success.
+
+Ordinary messages sent during compaction are queued and run after compaction
+finishes; they do not cancel it. `/stop` cancels compaction and clears the queue,
+while `/reset` additionally clears the session as usual. A second `/compact`
+while busy is rejected. Failed or timed-out compaction never automatically
+resets the existing session. Compaction is limited to five minutes.
+
+Use a Codex CLI supporting
+[app-server thread/compact/start](https://developers.openai.com/codex/app-server/).
+An existing session is required; attachments and additional arguments are not accepted.
 
 ## Kimi Code Options {#kimi-code-options}
 
@@ -176,3 +211,11 @@ CLAUDE_DEFAULT_WORKING_DIRECTORY=/home/me/project
 workspace for every engine.
 
 See [Environment Variables](environment-variables.md) for the full list.
+
+### Claude Code manual compaction
+
+The default persistent PTY backend also supports `/compact` while idle. The bridge runs the native command and waits for the manual `PostCompact` event instead of treating the generic slash-command idle timeout as success. The session is preserved. Ordinary messages queue until completion; `/stop` or `/reset` cancels. Requires Claude Code with `PostCompact` support (validated with 2.1.280). The legacy SDK backend and non-persistent execution are unsupported.
+
+### Claude Code steering
+
+The default persistent PTY backend also supports `/append text` and `/steer text`. Input goes to the running Claude Code composer without interrupting the task; Claude consumes it at an available tool boundary. Ordinary messages remain queued. Permission menus, questions, or an unavailable composer reject steering. The legacy SDK backend and non-persistent execution are unsupported.

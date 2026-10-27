@@ -166,6 +166,8 @@ export interface PtyParsedQuestion {
  *   2. interrupt(): Promise<void> (for turn abort)
  */
 export interface PtyQuery extends AsyncIterable<SDKMessage> {
+  canSteer?(): boolean;
+  steer?(text: string): Promise<'steered' | 'no-active-turn'>;
   /** Interrupt the in-flight turn (sends ESC/Ctrl-C to the TUI). */
   interrupt(): Promise<void>;
   /** Tear down the PTY process + scanner. Called on executor shutdown. */
@@ -203,6 +205,12 @@ export interface PtyClaudeSession {
   ready(): Promise<void>;
   /** Type a prompt string into the TUI and submit it. */
   typePrompt(text: string): Promise<void>;
+  /**
+   * Submit plain text while the model is working, without interrupting it.
+   * `isCurrent` is re-checked before the terminal Enter; if the turn was lost
+   * meanwhile the pasted text is cleared instead and this resolves false.
+   */
+  steerPrompt?(text: string, isCurrent?: () => boolean): Promise<boolean>;
   /**
    * Write raw bytes to the PTY (no prompt-submit framing). Used by the
    * interactive-tool keystroke layer to drive native TUI menus.
@@ -328,6 +336,8 @@ export type SynthesizeResult = (args: SynthesizeResultArgs) => SDKMessage;
  * at small bridge scripts) and returns its path for the session to consume.
  */
 export interface PtyHookBridge {
+  /** Native manual-compaction completion; distinct from the ordinary Stop hook. */
+  onCompactComplete?(cb: () => void): void;
   /** Absolute path of the generated settings.json (with command hooks). */
   writeSettings(): Promise<string>;
   /** Register the per-turn completion callback (Stop hook sentinel). */

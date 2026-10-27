@@ -10,6 +10,7 @@ import type {
   Engine,
   Executor,
   ExecutionHandle,
+  SDKMessage,
   EngineName,
   TeamEvent,
   ApiContext,
@@ -33,6 +34,7 @@ import type { RestartTaskSnapshot } from './restart-coordinator.js';
 import { MemoryClient } from '../memory/memory-client.js';
 import { AuditLogger } from '../utils/audit-logger.js';
 import { CommandHandler } from './command-handler.js';
+import { ShadowMode } from './shadow-mode.js';
 import { OutputHandler } from './output-handler.js';
 import { CostTracker } from '../utils/cost-tracker.js';
 import { metrics } from '../utils/metrics.js';
@@ -61,6 +63,11 @@ import { buildAgentTeamPromptContextForChat } from '../agent-teams/prompt-contex
 export { isContextOverflowError, isStaleSessionError, isUnknownModelError } from './error-classifiers.js';
 export { normalizePromptForEngine } from './prompt-normalizer.js';
 export { extractSpontaneousSnippet, formatSpontaneousCardBody } from './spontaneous-activity.js';
+
+export function isSyntheticActivityChatId(chatId: string): boolean {
+  return chatId.startsWith('bus:') || chatId.startsWith('core-') || chatId.startsWith('team:')
+    || /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(chatId);
+}
 
 const TASK_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
 const QUESTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes for user to answer
@@ -183,6 +190,8 @@ export interface ActivityEventData {
 }
 
 export class MessageBridge {
+  private readonly shadowMode: ShadowMode;
+  private shadowTargetOpenId?: string;
   private engine: Engine;
   private executor: Executor;
   /** Lazy per-engine cache so a session override doesn't pay instantiation cost each turn. */
@@ -298,6 +307,25 @@ export class MessageBridge {
 
     const memoryClient = new MemoryClient(logger);
 
+    this.shadowMode = new ShadowMode({
+      generate: async (chatId, prompt) => {
+        const shadowChatId = `shadow:${chatId}`;
+        this.sessionManager.resetSession(shadowChatId);
+        const session = this.sessionManager.getSession(chatId);
+        const engine = session.engine ?? defaultEngineName;
+        const result = await this.executeApiTask({
+          chatId: shadowChatId, userId: 'shadow', prompt, sendCards: false, allowedTools: [],
+          engine, model: session.modelEngine === engine ? session.model : undefined,
+        });
+        return result.success ? result.responseText.trim() : undefined;
+      },
+      deliver: (chatId, text, idempotencyKey) => this.sender.sendTextAsUser!(chatId, text, idempotencyKey),
+      notice: (chatId, title, content, color) => this.sender.sendTextNotice(chatId, title, content, color),
+      logger,
+      profilePath: path.join(config.claude.defaultWorkingDirectory, '.metabot', 'shadow-profile.md'),
+      targetMention: () => this.shadowTargetOpenId ? `<at user_id="${this.shadowTargetOpenId}">${config.name}</at> ` : '',
+    });
+
     this.commandHandler = new CommandHandler(
       config, logger, sender, this.sessionManager, memoryClient, this.audit,
       (chatId) => this.startingTasks.get(chatId) ?? this.runningTasks.get(chatId),
@@ -306,6 +334,18 @@ export class MessageBridge {
       (chatId, reason) => this.releaseChatExecutor(chatId, reason),
       (chatId) => this.listSessionsForChat(chatId),
       (chatId, sessionId) => this.applyResume(chatId, sessionId),
+      async (msg, args) => {
+        const allowedUsers = (process.env.METABOT_AUTO_ALLOWED_USER_IDS || '').split(',').map(value => value.trim()).filter(Boolean);
+        if (!allowedUsers.includes(msg.userId)) {
+          await this.sender.sendTextNotice(msg.chatId, 'Shadow Mode unavailable', 'The deployment owner must explicitly allow your user ID in METABOT_AUTO_ALLOWED_USER_IDS before user-identity automation can run.', 'orange');
+          return;
+        }
+        if (!this.sender.sendTextAsUser || !this.shadowTargetOpenId) {
+          await this.sender.sendTextNotice(msg.chatId, 'Shadow Mode unavailable', 'This channel requires a Feishu/Lark bot identity and a user-authorized Lark client.', 'orange');
+          return;
+        }
+        await this.shadowMode.command(msg, args);
+      },
     );
 
     this.outputHandler = new OutputHandler(logger, sender, this.outputsManager);
@@ -448,6 +488,10 @@ export class MessageBridge {
     };
   }
 
+  setShadowTargetOpenId(openId: string | undefined): void {
+    this.shadowTargetOpenId = openId;
+  }
+
   /** Inject the doc sync service for /sync commands. */
   setDocSync(docSync: DocSync): void {
     this.commandHandler.setDocSync(docSync);
@@ -481,6 +525,23 @@ export class MessageBridge {
 
   isBusy(chatId: string): boolean {
     return this.isChatBusy(chatId);
+  }
+
+  async steerAgentNotification(chatId: string, text: string): Promise<boolean> {
+    if (!this.isChatBusy(chatId)) return false;
+    const engineName = this.sessionManager.getSession(chatId).engine ?? resolveEngineName(this.config);
+    const executor = engineName === 'claude' && this.isPersistentExecutorEnabled()
+      ? this.persistentRegistry?.peek(chatId)
+      : undefined;
+    try {
+      if (executor?.canSteer()) return await executor.steer(text) === 'steered';
+      if (engineName === 'claude') return false;
+      const native = this.executorForEngine(chatId, engineName);
+      return !!native.canSteer?.(chatId) && await native.steer?.(chatId, text) === 'steered';
+    } catch (err) {
+      this.logger.warn({ err, chatId }, 'Agent Bus notification steering failed');
+      return false;
+    }
   }
 
   private isChatBusy(chatId: string): boolean {
@@ -1455,6 +1516,7 @@ export class MessageBridge {
       apiContext?: ApiContext;
       model?: string;
       reasoningEffort?: import('../config.js').CodexReasoningEffort;
+      serviceTier?: 'fast' | 'flex' | 'default';
       onTeamEvent?: (event: TeamEvent) => void;
       maxTurns?: number;
       allowedTools?: string[];
@@ -1505,6 +1567,7 @@ export class MessageBridge {
       apiContext: opts.apiContext,
       model: opts.forceEndpointDefaultModel ? undefined : opts.model,
       reasoningEffort: engineName === 'codex' ? opts.reasoningEffort ?? session.reasoningEffort : undefined,
+      serviceTier: engineName === 'codex' ? opts.serviceTier ?? session.serviceTier : undefined,
       onTeamEvent: opts.onTeamEvent,
       maxTurns: opts.maxTurns,
       allowedTools: opts.allowedTools,
@@ -1660,16 +1723,24 @@ export class MessageBridge {
 
   private enrichWithAgentTeams(state: CardState, chatId?: string): CardState {
     if (!this.agentTeamStore) return state;
-    const team = chatId ? this.agentTeamStore.findTeamForChat(chatId) : undefined;
-    if (!team) return state;
-    const snapshot = this.agentTeamStore.status(team.name);
-    if (!snapshot) return state;
-    const mapped = buildAgentTeamCardSnapshot(snapshot);
-    return {
-      ...state,
-      teamState: hasTeamState(state.teamState) ? state.teamState : mapped.teamState,
-      backgroundEvents: mergeBackgroundEvents(state.backgroundEvents, mapped.backgroundEvents),
-    };
+    // During shutdown the store may already be closed while a turn is still
+    // finalizing its card. Enrichment is auxiliary — never let it fail the turn.
+    try {
+      if (this.agentTeamStore.isClosed()) return state;
+      const team = chatId ? this.agentTeamStore.findTeamForChat(chatId) : undefined;
+      if (!team) return state;
+      const snapshot = this.agentTeamStore.status(team.name);
+      if (!snapshot) return state;
+      const mapped = buildAgentTeamCardSnapshot(snapshot);
+      return {
+        ...state,
+        teamState: hasTeamState(state.teamState) ? state.teamState : mapped.teamState,
+        backgroundEvents: mergeBackgroundEvents(state.backgroundEvents, mapped.backgroundEvents),
+      };
+    } catch (err) {
+      this.logger.warn({ err, chatId }, 'enrichWithAgentTeams failed; rendering card without team state');
+      return state;
+    }
   }
 
   /**
@@ -1746,6 +1817,122 @@ export class MessageBridge {
     await this.handleAnswer(syntheticMsg, task);
   }
 
+  private async tryHandleSessionCompaction(msg: IncomingMessage, engineName: 'claude' | 'codex' = 'codex'): Promise<boolean> {
+    const match = msg.text.trim().match(/^\/(compact)(?:\s+([\s\S]*))?$/i);
+    if (!match) return false;
+    const { chatId } = msg;
+    const argument = match[2]?.trim() ?? '';
+    const notice = (title: string, body: string, color: 'blue' | 'orange' | 'green' | 'red' = 'orange') =>
+      this.sender.sendTextNotice(chatId, title, body, color);
+    if (msg.imageKey || msg.fileKey || msg.extraMedia?.length) {
+      await notice('请使用纯文本命令', '直接发送 /compact，不要附加图片或文件。');
+      return true;
+    }
+    if (engineName === 'claude' && (!this.isPersistentExecutorEnabled() || this.config.claude.backend === 'sdk')) {
+      await notice('Claude Code 功能未启用', '压缩和插话需要默认的持久 PTY 后端。');
+      return true;
+    }
+    const executor = this.executorForEngine(chatId, engineName);
+    if (argument) {
+      await notice('压缩用法', '直接发送 /compact，目前不接受额外参数。');
+      return true;
+    }
+    const session = this.sessionManager.getSession(chatId);
+    if (!session.sessionId) {
+      await notice('暂无可压缩的会话', '先与机器人对话，再发送 /compact。');
+      return true;
+    }
+    const task = this.reserveTaskStart(chatId, '/compact', 'chat', true);
+    if (!task) {
+      await notice('任务正在运行', '请等待当前任务完成后再发送 /compact。');
+      return true;
+    }
+    let handle: ExecutionHandle | undefined;
+    const abortCompact = () => handle?.finish();
+    task.abortController.signal.addEventListener('abort', abortCompact, { once: true });
+    const timer = setTimeout(() => task.abortController.abort(), 5 * 60_000);
+    try {
+      await notice('正在压缩上下文', '保留当前会话 ID，压缩完成后可继续对话。可用 /stop 取消。', 'blue');
+      if (task.abortController.signal.aborted) return true;
+      handle = engineName === 'claude'
+        ? await this.runOneTurn(chatId, 'claude', {
+          prompt: '/compact', cwd: session.workingDirectory, model: session.model,
+          abortController: task.abortController, outputsDir: this.outputsManager.prepareDir(chatId),
+          apiContext: { botName: this.config.name, chatId, sessionId: session.sessionId },
+        })
+        : executor.compact!({
+        prompt: '', cwd: session.workingDirectory, sessionId: session.sessionId,
+        model: session.model, reasoningEffort: session.reasoningEffort,
+        abortController: task.abortController, apiContext: { botName: this.config.name, chatId },
+      });
+      if (task.abortController.signal.aborted) handle.finish();
+      let result: SDKMessage | undefined;
+      for await (const message of handle.stream) {
+        if (message.type === 'result') result = message;
+      }
+      if (task.abortController.signal.aborted) {
+        await notice('压缩已取消', '本次压缩未确认完成。');
+      } else if (!result || result.is_error) {
+        await notice('压缩失败', result?.errors?.join('\n') || '未确认压缩完成，会话未重置。', 'red');
+      } else {
+        await notice('上下文压缩完成', '当前会话 ID 保持不变，可以继续对话。', 'green');
+      }
+    } catch (err) {
+      this.logger.warn({ err, chatId }, 'Session compaction failed');
+      await notice('压缩失败', '会话未重置。请稍后重试，或查看运行日志。', 'red');
+    } finally {
+      clearTimeout(timer);
+      task.abortController.signal.removeEventListener('abort', abortCompact);
+      handle?.finish();
+      this.releaseTaskStart(chatId, task);
+      if (!this.isChatBusy(chatId)) this.processQueue(chatId);
+    }
+    return true;
+  }
+
+  private async tryHandleSessionSteering(msg: IncomingMessage, engineName: 'claude' | 'codex' = 'codex'): Promise<boolean> {
+    const match = msg.text.trim().match(/^\/(append|steer)(?:\s+([\s\S]*))?$/i);
+    if (!match) return false;
+    const { chatId } = msg;
+    const argument = match[2]?.trim() ?? '';
+    const notice = (title: string, body: string, color: 'blue' | 'orange' | 'green' | 'red' = 'orange') =>
+      this.sender.sendTextNotice(chatId, title, body, color);
+    if (engineName === 'codex' && this.config.codex?.transport !== 'app-server') {
+      await notice('Codex 功能未启用', '当前机器人使用 exec 模式。需要启用 codex.transport = app-server 才能插话。');
+      return true;
+    }
+    if (msg.imageKey || msg.fileKey || msg.extraMedia?.length) {
+      await notice('请使用纯文本命令', '/append 目前只支持文字；图片和文件请作为普通消息发送。');
+      return true;
+    }
+    if (engineName === 'claude' && (!this.isPersistentExecutorEnabled() || this.config.claude.backend === 'sdk')) {
+      await notice('Claude Code 功能未启用', '压缩和插话需要默认的持久 PTY 后端。');
+      return true;
+    }
+    const executor = this.executorForEngine(chatId, engineName);
+    const claude = engineName === 'claude' ? this.persistentRegistry?.peek(chatId) : undefined;
+    const canSteer = () => engineName === 'claude' ? claude?.canSteer() : executor.canSteer?.(chatId);
+    const steer = (text: string) => engineName === 'claude' ? claude!.steer(text) : executor.steer!(chatId, text);
+    if (!argument) {
+      await notice('插话用法', '在机器人正在工作时发送 /append 补充指示（/steer 同义）。普通消息仍会排队。');
+    } else if (!this.isChatBusy(chatId) || !canSteer()) {
+      await notice('当前没有可插话的任务', '任务可能尚未开始、已经结束或正在压缩。请稍后重试；没有运行任务时直接发送普通消息。');
+    } else {
+      try {
+        const result = await steer(argument);
+        await notice(
+          result === 'steered' ? '已提交插话' : '任务已结束',
+          result === 'steered' ? '补充指示已交给当前任务，机器人会在可处理的执行节点读取。' : '这条补充没有加入任务，请作为普通消息重新发送。',
+          result === 'steered' ? 'green' : 'orange',
+        );
+      } catch (err) {
+        this.logger.warn({ err, chatId }, 'Session steering request failed');
+        await notice('插话未确认', '未确认接收这条补充。请检查当前任务的回复，再决定是否重发。', 'red');
+      }
+    }
+    return true;
+  }
+
   async handleMessage(msg: IncomingMessage): Promise<void> {
     return withReplyContext(msg, () => this.handleMessageInContext(msg));
   }
@@ -1767,18 +1954,22 @@ export class MessageBridge {
     // an exact bare "reset" as /reset so it can abort a running PTY turn and
     // clear the session instead of being queued behind the old task.
     if (text.trim().toLowerCase() === 'reset') {
+      this.shadowMode.stop(chatId);
       await this.commandHandler.handle({ ...msg, text: '/reset' });
       return;
     }
 
     // Handle commands (always allowed, even during pending questions)
     if (text.startsWith('/')) {
+      if (/^\/(?:reset|new)(?:\s|$)/i.test(text)) this.shadowMode.stop(chatId);
       // Bare client-side slash commands (no argument) that we surface as a
       // selectable Feishu picker card instead of passing the argless command
       // through to the TUI (which would just open an autocomplete menu).
       if (await this.slashPickers.tryOpen(msg)) return;
 
       const activeEngine = this.sessionManager.getSession(chatId).engine ?? resolveEngineName(this.config);
+      if ((activeEngine === 'codex' || activeEngine === 'claude') && await this.tryHandleSessionCompaction(msg, activeEngine)) return;
+      if ((activeEngine === 'codex' || activeEngine === 'claude') && await this.tryHandleSessionSteering(msg, activeEngine)) return;
       if (activeEngine === 'codex' && await this.codexCommands.tryHandleBridgeCommand(msg)) return;
 
       const handled = await this.commandHandler.handle(msg);
@@ -1801,6 +1992,8 @@ export class MessageBridge {
       await this.startQuery(msg);
       return;
     }
+
+    this.shadowMode.observeInbound(msg);
 
     // Between-turn AskUserQuestion reply — must run BEFORE the
     // running-task / queue branches below, because no `runningTasks` entry
@@ -2303,6 +2496,7 @@ export class MessageBridge {
       transportChatId: this.sender.getTransportChatId?.(chatId),
       engine: engineName,
       sessionId: this.sessionManager.getSession(chatId).sessionId,
+      busSessionId: isSyntheticActivityChatId(chatId) ? undefined : this.sessionRegistry?.findByChatId(chatId)?.id,
       teamContext: this.agentTeamStore
         ? buildAgentTeamPromptContextForChat(this.agentTeamStore, chatId)
         : undefined,
@@ -2716,6 +2910,9 @@ export class MessageBridge {
 
       // Record in cross-platform session registry
       this.recordSession(chatId, displayPrompt, lastState.responseText, processor.getSessionId(), lastState.costUsd, durationMs);
+      if (lastState.status === 'complete') void this.shadowMode.observeFinal(chatId, text, lastState.responseText).catch(err => {
+        this.logger.warn({ err, chatId }, 'Shadow Mode final-turn observation failed');
+      });
 
       // Send completion notification for long-running tasks (>10s) so user gets a Feishu push
       await sendCompletionNotice({
@@ -2804,6 +3001,9 @@ export class MessageBridge {
           metrics.incCounter('metabot_tasks_by_status', lastState.status === 'complete' ? 'success' : 'error');
 
           this.recordSession(chatId, displayPrompt, lastState.responseText, processor.getSessionId(), lastState.costUsd, durationMs);
+          if (lastState.status === 'complete') void this.shadowMode.observeFinal(chatId, text, lastState.responseText).catch(err => {
+            this.logger.warn({ err, chatId }, 'Shadow Mode retry observation failed');
+          });
           await sendCompletionNotice({
             sender: this.sender,
             config: this.config,
@@ -2913,7 +3113,8 @@ export class MessageBridge {
     options: ApiTaskOptions,
     startingTask: StartingTask,
   ): Promise<ApiTaskResult> {
-    const { prompt: originalPrompt, chatId, userId = 'api', sendCards = false } = options;
+    const { prompt: originalPrompt, chatId, userId = 'api' } = options;
+    const sendCards = options.sendCards === true && !isSyntheticActivityChatId(chatId);
 
     const { session, engineName } = this.prepareSessionForApiExecution(chatId, options.engine);
     const prompt = await this.prepareTopicPrompt(chatId, originalPrompt);
@@ -2954,6 +3155,7 @@ export class MessageBridge {
       transportChatId: this.sender.getTransportChatId?.(chatId),
       engine: engineName,
       sessionId: this.sessionManager.getSession(chatId).sessionId,
+      busSessionId: isSyntheticActivityChatId(chatId) ? undefined : this.sessionRegistry?.findByChatId(chatId)?.id,
       teamContext: this.agentTeamStore
         ? buildAgentTeamPromptContextForChat(this.agentTeamStore, chatId)
         : undefined,
@@ -3402,6 +3604,7 @@ export class MessageBridge {
    * this so the cleanup body lives in one place.
    */
   private teardownSync(): Promise<void> {
+    this.shadowMode.destroy();
     for (const [, batch] of this.pendingBatches) {
       clearTimeout(batch.timerId);
     }
@@ -3442,6 +3645,7 @@ export class MessageBridge {
     this.pendingBetweenTurnQuestions.clear();
     this.recentQuestionCard.clear();
     this.exitPlanCardsShown.clear();
+    for (const task of this.startingTasks.values()) task.abortController.abort();
     this.startingTasks.clear();
     this.messageQueues.clear();
     this.sessionManager.destroy();

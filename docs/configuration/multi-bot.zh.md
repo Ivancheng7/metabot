@@ -92,8 +92,36 @@
 `reasoningEffort`、`approvalPolicy`、`sandbox`、`executable`、`extraArgs`
 和 `env`。普通订阅场景只需执行 `codex login`。
 
-公开版当前运行 `codex exec --json`，通过 `codex exec resume` 续接。Codex
-app-server 和原生执行中 steering 不属于当前公开行为。
+默认仍使用 `codex exec --json` 和 `codex exec resume`。设置
+`codex.transport: "app-server"` 并重启 MetaBot 后，可启用原生执行中插话，
+沿用已配置的模型、profile、环境变量、沙箱和审批策略。
+
+任务运行时发送 `/append 补充要求`（同义命令 `/steer`）；飞书群仅 @ 模式下
+需要 @机器人。成功提示表示 Codex 已接收，指示会在可处理的执行节点生效，
+不能撤销已完成的操作。普通消息仍排队；空闲、启动中、已结束或请求失败时
+会明确提示，不会偷偷另起任务或排队。
+
+该可选传输支持文字回复、命令事件、token 用量和阻塞式用户提问。
+交互式命令/文件审批请求会被拒绝，其他尚未支持的服务端请求返回明确错误，
+不会扩大已配置的权限。需要支持
+[app-server turn/steer](https://developers.openai.com/codex/app-server/) 的 Codex CLI，
+已使用 `0.163.0-alpha.11.1` 做真实集成验证。
+
+### 手动压缩上下文
+
+会话空闲时发送 `/compact`，压缩已有上下文并保留原会话 ID。桥接层临时启动
+本机 Codex app-server，续接原线程并调用 `thread/compact/start`；
+普通任务仍使用 `codex exec`，无需修改传输配置。只有收到压缩完成事件及成功
+结束的回合才报告完成，不把初始请求确认当作完成。
+
+**压缩期间发送普通消息会排队，压缩结束后才处理，不会取消压缩。**
+`/stop` 会取消压缩并清空队列，`/reset` 还会按原有语义清空会话。
+忙碌时再次发送 `/compact` 会被拒绝。失败或超时不会自动重置原会话。
+压缩最长等待五分钟。
+
+需要已有 Codex 会话及支持
+[thread/compact/start](https://developers.openai.com/codex/app-server/) 的 CLI；
+命令不接受附件和额外参数。
 
 ## Kimi Code 配置 {#kimi-code-options}
 
@@ -172,3 +200,11 @@ CLAUDE_DEFAULT_WORKING_DIRECTORY=/home/me/project
 `CLAUDE_DEFAULT_WORKING_DIRECTORY` 保留了历史名称，但会为所有引擎提供工作区。
 
 完整列表见[环境变量](environment-variables.md)。
+
+### Claude Code 手动压缩
+
+默认的持久 PTY 后端同样支持空闲时发送 `/compact`。桥接层执行原生命令，并等待 `PostCompact` 的 manual 完成信号，而不使用普通斜杠命令的空闲超时判断成功。压缩保留原会话；期间普通消息排队，完成后处理，`/stop` 或 `/reset` 可取消。需要支持 `PostCompact` 的 Claude Code（已验证 2.1.280）。旧 SDK 后端或关闭持久执行器时不支持。
+
+### Claude Code 插话
+
+默认的持久 PTY 后端同样支持 `/append 内容` 和 `/steer 内容`。消息送入运行中的 Claude Code 输入框，不中断当前任务；Claude 会在可处理输入的工具执行边界读取。普通消息仍排队。权限选择、问答或输入框暂不可用时会提示未接收。旧 SDK 后端或关闭持久执行器时不支持。
