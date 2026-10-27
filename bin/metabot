@@ -188,7 +188,10 @@ cmd_update() {
   fi
 
   info "Installing dependencies..."
+  source "$METABOT_HOME/scripts/node-runtime.sh"
+  metabot_select_node "$METABOT_HOME"
   npm install --production=false
+  metabot_verify_native "$METABOT_HOME"
 
   info "Building bridge and metabot CLI..."
   npm run build:bridge
@@ -202,7 +205,7 @@ cmd_update() {
     info "Building local metabot-core and Web UI..."
     npm run build -w @xvirobotics/metabot-core-server
     npm run build -w @xvirobotics/metabot-core-web-ui
-    pm2 restart metabot-core --update-env
+    pm2 restart metabot-core --interpreter "$METABOT_NODE_PATH" --update-env
   fi
 
   # Update CLI tools in ~/.local/bin.
@@ -439,7 +442,7 @@ cmd_update() {
     # There is no running Bridge to quiesce or recover. Preserve the previous
     # update behavior for stopped/fresh installations.
     warn "MetaBot is not running; starting it without restart recovery."
-    pm2 start ecosystem.config.cjs
+    pm2 start ecosystem.config.cjs --interpreter "$METABOT_NODE_PATH"
   fi
   pm2 save --force 2>/dev/null || true
 
@@ -639,7 +642,9 @@ cmd_restart() {
   fi
 
   _write_restart_breadcrumb "$request_id" "$requester_bot" "$requester_chat" "$source" "$reason" "$resume"
-  if ! pm2 restart metabot; then
+  local -a interpreter_args=()
+  [[ -n "${METABOT_NODE_PATH:-}" ]] && interpreter_args=(--interpreter "$METABOT_NODE_PATH")
+  if ! pm2 restart metabot "${interpreter_args[@]}"; then
     [[ "$prepared" == true ]] && _cancel_controlled_restart "$request_id"
     _clear_restart_breadcrumb "$request_id"
     error "PM2 rejected controlled restart $request_id; Bridge quiesce was cancelled."
@@ -1781,7 +1786,7 @@ print_help() {
   echo "  Process control:"
   echo "    metabot update            Auto: git checkout pulls; package install downloads release"
   echo "    metabot update --package  Refresh from the latest GitHub Release package"
-  echo "    metabot update --package --version 1.3.2  Install one immutable release"
+  echo "    metabot update --package --version 1.3.4  Install one immutable release"
   echo "    metabot update --git      Git pull, rebuild, and restart"
   echo "    metabot start      Start MetaBot with PM2"
   echo "    metabot stop       Stop MetaBot"

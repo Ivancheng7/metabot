@@ -227,7 +227,7 @@ export function buildHelpCard(): string {
         tag: 'markdown',
         content: [
           '**Available Commands:**',
-          '`/reset` - Clear session, start fresh',
+          '`/reset` or `/new` - Clear session and /goal, start fresh (working directory preserved)',
           '`/stop` - Abort current running task',
           '`/status` - Show current session info',
           '`/memory` - Memory document commands',

@@ -182,7 +182,9 @@ describe('listCodexSessions', () => {
     });
 
     expect(out.map((s) => s.sessionId)).toEqual(['codex-new', 'codex-old']);
+    expect(out[0].name).toBe('new title');
     expect(out[0].preview).toBe('new preview');
+    expect(out[1].name).toBe('old title');
     expect(out[1].preview).toBe('old prompt');
     expect(out[1].isCurrent).toBe(true);
   });

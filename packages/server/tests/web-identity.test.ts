@@ -12,7 +12,7 @@ afterEach(async () => {
   process.env = { ...ORIG_ENV };
 });
 
-const WHITELISTED = 'flood-sung@xvirobotics.com';
+const WHITELISTED = 'alice@example.com';
 
 async function issueMember(k: ServerKit): Promise<string> {
   const res = await call(k.baseUrl, 'POST', '/admin/credentials/issue', k.adminToken, {
@@ -26,6 +26,94 @@ async function issueMember(k: ServerKit): Promise<string> {
 }
 
 describe('web-identity — enabled (METABOT_CORE_UI_ALLOWED_EMAILS set)', () => {
+  it('allows owned Bus reads and sends without trusting agent visibility for private sessions', async () => {
+    const other = 'bob@example.com';
+    kit = await startTestServer('web-bus-ownership', { uiAllowedEmails: [WHITELISTED, other] });
+    const owner = await call(kit.baseUrl, 'POST', '/admin/credentials/issue', kit.adminToken, {
+      botName: 'target',
+      ownerName: WHITELISTED,
+      role: 'member',
+    });
+    const agent = kit.handle.agentStore.register({
+      botName: 'target',
+      url: 'inbox:',
+      ownerCredentialId: owner.body.credential.id,
+      ownerName: WHITELISTED,
+    });
+    const seed = await call(kit.baseUrl, 'POST', '/api/messages', kit.adminToken, {
+      agentId: agent.id,
+      message: 'private seed',
+    });
+    expect(seed.status).toBe(202);
+    const headers = { 'X-Forwarded-Email': WHITELISTED, 'Content-Type': 'application/json' };
+    const list = await rawRequest(kit.port, 'GET', `/api/messages/sessions?agentId=${agent.id}`, headers);
+    expect(list.status).toBe(200);
+    expect(JSON.parse(list.body).sessions).toHaveLength(1);
+    const history = await rawRequest(
+      kit.port,
+      'GET',
+      `/api/messages/history?sessionId=${seed.body.sessionId}`,
+      headers,
+    );
+    expect(history.status).toBe(200);
+    expect(JSON.parse(history.body).messages[0].content).toBe('private seed');
+    const sent = await rawRequest(
+      kit.port,
+      'POST',
+      '/api/messages',
+      headers,
+      JSON.stringify({ agentId: agent.id, sessionId: seed.body.sessionId, message: 'web follow-up' }),
+    );
+    expect(sent.status).toBe(202);
+    const roomId = kit.handle.messageStore.getSession(seed.body.sessionId)!.roomId!;
+    expect(kit.handle.chatStore.hasParticipant(roomId, 'user', WHITELISTED)).toBe(true);
+    const foreignHeaders = { ...headers, 'X-Forwarded-Email': other };
+    const foreignList = await rawRequest(kit.port, 'GET', `/api/messages/sessions?agentId=${agent.id}`, foreignHeaders);
+    expect(foreignList.status).toBe(200);
+    expect(JSON.parse(foreignList.body)).toMatchObject({ sessions: [], total: 0 });
+    expect(
+      (await rawRequest(kit.port, 'GET', `/api/messages/history?sessionId=${seed.body.sessionId}`, foreignHeaders))
+        .status,
+    ).toBe(404);
+    expect(
+      (
+        await rawRequest(
+          kit.port,
+          'POST',
+          '/api/messages',
+          foreignHeaders,
+          JSON.stringify({ agentId: agent.id, sessionId: seed.body.sessionId, message: 'inject' }),
+        )
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await rawRequest(
+          kit.port,
+          'POST',
+          '/api/messages',
+          foreignHeaders,
+          JSON.stringify({ agentId: agent.id, senderSessionId: seed.body.sessionId, message: 'inject return' }),
+        )
+      ).status,
+    ).toBe(403);
+    expect(kit.handle.chatStore.hasParticipant(roomId, 'user', other)).toBe(false);
+    expect(
+      (await rawRequest(kit.port, 'POST', '/api/messages/sessions', headers, JSON.stringify({ agentId: agent.id })))
+        .status,
+    ).toBe(404);
+    expect((await rawRequest(kit.port, 'GET', '/api/messages/stream?agentId=target', headers)).status).toBe(404);
+    const bearer = await rawRequest(kit.port, 'GET', `/api/messages/history?sessionId=${seed.body.sessionId}`, {
+      ...foreignHeaders,
+      Authorization: `Bearer ${owner.body.token}`,
+    });
+    expect(bearer.status).toBe(200);
+    kit.handle.agentStore.setVisibility('target', false);
+    expect((await rawRequest(kit.port, 'GET', '/api/messages/sessions?agentId=target', foreignHeaders)).status).toBe(
+      404,
+    );
+  });
+
   it('whitelisted email → GET memory/skill routes 200', async () => {
     kit = await startTestServer('web-id', { uiAllowedEmails: [WHITELISTED] });
     for (const p of [
@@ -49,19 +137,13 @@ describe('web-identity — enabled (METABOT_CORE_UI_ALLOWED_EMAILS set)', () => 
     // way these are reachable GETs, so assert they are not blocked with a
     // generic structural 404 by checking a known-good collection first, then
     // that detail routes return a route-level status (200/404), never 403.
-    const detail = await rawRequest(
-      kit.port,
-      'GET',
-      '/api/memory/documents/%2Fnope',
-      { 'X-Forwarded-Email': WHITELISTED },
-    );
+    const detail = await rawRequest(kit.port, 'GET', '/api/memory/documents/%2Fnope', {
+      'X-Forwarded-Email': WHITELISTED,
+    });
     expect([200, 404]).toContain(detail.status);
-    const skillDetail = await rawRequest(
-      kit.port,
-      'GET',
-      '/api/skills/does-not-exist',
-      { 'X-Forwarded-Email': WHITELISTED },
-    );
+    const skillDetail = await rawRequest(kit.port, 'GET', '/api/skills/does-not-exist', {
+      'X-Forwarded-Email': WHITELISTED,
+    });
     expect([200, 404]).toContain(skillDetail.status);
   });
 
@@ -113,7 +195,7 @@ describe('web-identity — enabled (METABOT_CORE_UI_ALLOWED_EMAILS set)', () => 
   it('email lookup is case-insensitive', async () => {
     kit = await startTestServer('web-id-ci', { uiAllowedEmails: [WHITELISTED] });
     const res = await rawRequest(kit.port, 'GET', '/api/memory/folders', {
-      'X-Forwarded-Email': 'FLOOD-SUNG@XViRobotics.com',
+      'X-Forwarded-Email': 'ALICE@EXAMPLE.com',
     });
     expect(res.status).toBe(200);
   });
@@ -165,13 +247,19 @@ describe('web-identity — enabled (METABOT_CORE_UI_ALLOWED_EMAILS set)', () => 
 
   it('whitelisted email can transcribe chat voice through the bridge STT proxy', async () => {
     process.env.METABOT_CORE_CHAT_VOICE_URL = 'http://bridge.test/api/voice';
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
-      success: true,
-      transcript: '你好 metabot',
-    }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    })) as unknown as typeof fetch;
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            success: true,
+            transcript: '你好 metabot',
+          }),
+          {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          },
+        ),
+    ) as unknown as typeof fetch;
     vi.stubGlobal('fetch', fetchMock);
     kit = await startTestServer('web-id-voice', { uiAllowedEmails: [WHITELISTED] });
 
@@ -194,6 +282,23 @@ describe('web-identity — enabled (METABOT_CORE_UI_ALLOWED_EMAILS set)', () => 
 });
 
 describe('web-identity — disabled (env unset, default-off)', () => {
+  it('does not enable Bus access from forwarded headers by default', async () => {
+    kit = await startTestServer('web-bus-disabled');
+    const headers = { 'X-Forwarded-Email': WHITELISTED, 'Content-Type': 'application/json' };
+    expect((await rawRequest(kit.port, 'GET', '/api/messages/sessions?agentId=target', headers)).status).toBe(401);
+    expect(
+      (
+        await rawRequest(
+          kit.port,
+          'POST',
+          '/api/messages',
+          headers,
+          JSON.stringify({ agentId: 'target', message: 'hello' }),
+        )
+      ).status,
+    ).toBe(401);
+  });
+
   it('X-Forwarded-Email is ignored entirely; falls to Bearer path → 401', async () => {
     kit = await startTestServer('web-id-off');
     const res = await rawRequest(kit.port, 'GET', '/api/memory/folders', {

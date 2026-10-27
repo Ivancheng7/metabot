@@ -4,13 +4,13 @@ import * as path from 'node:path';
 import { once } from 'node:events';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { loadAppConfig, type BotConfig } from './config.js';
-import { createLogger, type Logger } from './utils/logger.js';
+import { createLarkSdkLogger, createLogger, type Logger } from './utils/logger.js';
 import { createEventDispatcher } from './feishu/event-handler.js';
 import { FeishuGroupReplyModeStore } from './feishu/group-reply-mode-store.js';
 import { MessageSender } from './feishu/message-sender.js';
 import { FeishuTurnStore } from './feishu/turn-store.js';
 import { FeishuSenderAdapter } from './feishu/feishu-sender-adapter.js';
-import { resolveFeishuWsRecoveryOptions } from './feishu/ws-recovery.js';
+import { installFeishuWsTerminateGuard, resolveFeishuWsRecoveryOptions } from './feishu/ws-recovery.js';
 import { MessageBridge } from './bridge/message-bridge.js';
 import { loadRestartBreadcrumb } from './bridge/restart-notice.js';
 import { recoverControlledRestartAfterStartup } from './bridge/restart-coordinator.js';
@@ -79,6 +79,7 @@ async function startFeishuBot(
   localAgent?: https.Agent,
 ): Promise<FeishuBotHandle> {
   const botLogger = logger.child({ bot: botConfig.name });
+  const larkLogger = createLarkSdkLogger(botLogger);
 
   botLogger.info('Starting Feishu bot...');
 
@@ -88,6 +89,7 @@ async function startFeishuBot(
     appSecret: botConfig.feishu.appSecret,
     domain: botConfig.feishu.domain === 'lark' ? lark.Domain.Lark : lark.Domain.Feishu,
     disableTokenCache: false,
+    logger: larkLogger,
   });
 
   // Fetch bot info to get bot's open_id for accurate @mention detection
@@ -115,6 +117,7 @@ async function startFeishuBot(
     path.join(process.env.SESSION_STORE_DIR || path.join(os.homedir(), '.metabot'), 'feishu-turns', botConfig.name),
   ), botLogger);
   const bridge = new MessageBridge(botConfig, botLogger, sender);
+  bridge.setShadowTargetOpenId(botOpenId);
 
   // Create event dispatcher wired to the bridge
   const dispatcher = createEventDispatcher(
@@ -140,12 +143,14 @@ async function startFeishuBot(
   );
 
   // Create WebSocket client with bounded liveness/reconnect controls.
+  installFeishuWsTerminateGuard();
   const wsRecovery = resolveFeishuWsRecoveryOptions();
   const wsClient = new lark.WSClient({
     appId: botConfig.feishu.appId,
     appSecret: botConfig.feishu.appSecret,
     domain: botConfig.feishu.domain === 'lark' ? lark.Domain.Lark : lark.Domain.Feishu,
     loggerLevel: lark.LoggerLevel.info,
+    logger: larkLogger,
     agent: localAgent,
     ...wsRecovery,
     onReady: () => botLogger.info('Feishu WebSocket connected'),
@@ -386,6 +391,7 @@ async function main() {
       appId: appConfig.feishuService.appId,
       appSecret: appConfig.feishuService.appSecret,
       disableTokenCache: false,
+      logger: createLarkSdkLogger(logger.child({ component: 'feishu-service' })),
     });
     logger.info('Feishu service client initialized (for wiki sync & doc reader)');
   }

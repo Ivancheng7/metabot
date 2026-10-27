@@ -49,6 +49,9 @@ describe('GitHub release package', () => {
     expect(listing).toContain('ecosystem.core.config.cjs');
     expect(listing).toContain('packages/server/package.json');
     expect(listing).toContain('packages/web-ui/package.json');
+    expect(listing).toContain('scripts/node-runtime.sh');
+    expect(listing).toContain('scripts/check-native.cjs');
+    expect(listing).toContain('scripts/with-system-node.sh');
     expect(listing).not.toContain('packages/server/static/');
     expect(listing).not.toMatch(/(^|\n)\.?\/?web\//);
 
@@ -57,12 +60,14 @@ describe('GitHub release package', () => {
     );
     expect(manifest).toMatchObject({
       package: 'metabot-personal-edition',
-      version: '1.3.2',
+      version: '1.3.4',
       includesCore: true,
       includesWebUi: true,
     });
 
     const packageJson = JSON.parse(execSync(`tar xOf ${JSON.stringify(TARBALL)} package.json`, { encoding: 'utf-8' }));
+    expect(packageJson.version).toBe('1.3.4');
+    expect(manifest.version).toBe(packageJson.version);
     expect(packageJson.workspaces).toContain('packages/server');
     expect(packageJson.workspaces).toContain('packages/web-ui');
     expect(packageJson.metabotEdition).toBe('personal');

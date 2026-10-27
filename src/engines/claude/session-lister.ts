@@ -15,6 +15,7 @@ import * as path from 'node:path';
 
 export interface SessionSummary {
   sessionId: string;
+  name?: string;
   /** First real user prompt, whitespace-collapsed + truncated. */
   preview: string;
   /** Last-modified time of the .jsonl (ms since epoch). */
