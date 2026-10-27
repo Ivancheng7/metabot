@@ -24,7 +24,7 @@ describe('hasRunningBackgroundWork', () => {
     expect(
       hasRunningBackgroundWork(
         makeState({
-          backgroundEvents: [{ taskId: 'monitor', description: 'release monitor', status: 'running' }],
+          backgroundEvents: [{ kind: 'work', taskId: 'monitor', description: 'release monitor', status: 'running' }],
         }),
       ),
     ).toBe(true);
@@ -35,8 +35,8 @@ describe('hasRunningBackgroundWork', () => {
       hasRunningBackgroundWork(
         makeState({
           backgroundEvents: [
-            { taskId: 'a', description: 'a', status: 'completed' },
-            { taskId: 'b', description: 'b', status: 'failed' },
+            { kind: 'work', taskId: 'a', description: 'a', status: 'completed' },
+            { kind: 'work', taskId: 'b', description: 'b', status: 'failed' },
           ],
         }),
       ),
@@ -49,7 +49,7 @@ describe('activityTypeForState', () => {
     expect(
       activityTypeForState(
         makeState({
-          backgroundEvents: [{ taskId: 'monitor', description: 'release monitor', status: 'running' }],
+          backgroundEvents: [{ kind: 'work', taskId: 'monitor', description: 'release monitor', status: 'running' }],
         }),
       ),
     ).toBe('task_waiting');
@@ -64,7 +64,7 @@ describe('activityTypeForState', () => {
       activityTypeForState(
         makeState({
           status: 'error',
-          backgroundEvents: [{ taskId: 'monitor', description: 'release monitor', status: 'running' }],
+          backgroundEvents: [{ kind: 'work', taskId: 'monitor', description: 'release monitor', status: 'running' }],
         }),
       ),
     ).toBe('task_failed');

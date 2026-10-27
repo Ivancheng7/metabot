@@ -112,7 +112,7 @@ describe('sendCompletionNotice', () => {
     const sender = makeSender();
     const state = {
       ...makeState('complete'),
-      backgroundEvents: [{ taskId: 'monitor-1', description: 'Monitor release', status: 'running' as const }],
+      backgroundEvents: [{ kind: 'work' as const, taskId: 'monitor-1', description: 'Monitor release', status: 'running' as const }],
     };
 
     await sendCompletionNotice({
@@ -131,7 +131,7 @@ describe('sendCompletionNotice', () => {
     const sender = makeSender();
     const state = {
       ...makeState('complete'),
-      backgroundEvents: [{ taskId: 'monitor-1', description: 'Monitor release', status: 'completed' as const }],
+      backgroundEvents: [{ kind: 'work' as const, taskId: 'monitor-1', description: 'Monitor release', status: 'completed' as const }],
     };
 
     await sendCompletionNotice({
@@ -157,6 +157,23 @@ describe('sendCompletionNotice', () => {
       durationMs: 10_000,
     });
 
+    expect(sender.sendText).toHaveBeenCalledWith('chat', '❌ Failed');
+  });
+
+  it.each(['Engine failed', 'Task timed out'])('notifies failure with live work for %s', async (errorMessage) => {
+    const sender = makeSender();
+    await sendCompletionNotice({
+      sender,
+      config: makeConfig(),
+      logger: { warn: vi.fn() } as any,
+      chatId: 'chat',
+      state: {
+        ...makeState('error'),
+        errorMessage,
+        backgroundEvents: [{ kind: 'work', taskId: 'live', description: 'monitor', status: 'running' }],
+      },
+      durationMs: 20_000,
+    });
     expect(sender.sendText).toHaveBeenCalledWith('chat', '❌ Failed');
   });
 
