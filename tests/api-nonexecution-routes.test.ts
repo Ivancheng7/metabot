@@ -138,12 +138,12 @@ function fixture(route: Route) {
   }
 
   async function halfOpen() {
-    const now = vi.spyOn(Date, 'now').mockReturnValue(0);
+    const now = vi.spyOn(Date, 'now').mockReturnValue(10_000);
     const admission = circuitBreaker.tryAcquire('bot');
     expect(admission).toBeDefined();
     admission?.settle('failure');
     expect(circuitBreaker.getStatus().bot).toEqual({ state: 'open', failures: 1 });
-    now.mockReturnValue(1000);
+    now.mockReturnValue(11_000);
   }
 
   return { bridge, circuitBreaker, chatId, completeRequest, request, parkStart, halfOpen, pending };
