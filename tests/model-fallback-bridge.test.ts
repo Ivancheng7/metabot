@@ -131,6 +131,31 @@ describe('unknown-model canonical lifecycle', () => {
     expect(ctx.manager.getSession('chat').model).toBe('retired');
   });
 
+  it.each(['maximum context length exceeded', 'No conversation found with session ID old'])(
+    'does not replay a resumed turn after a tool and %s', async error => {
+      const ctx = fixture();
+      ctx.manager.setSessionId('chat', 'old', 'claude');
+      ctx.start.mockReturnValueOnce(handle([
+        { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', id: 'write', input: { command: 'write output' } }] } },
+        { ...rejection, errors: [error] },
+      ])).mockReturnValueOnce(handle([success]));
+      const result = await ctx.bridge.executeApiTask({ chatId: 'chat', prompt: 'work' });
+      expect(result.success).toBe(false);
+      expect(ctx.start).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('recovers an explicit zero-turn unknown-model error with an unprefixed result', async () => {
+    const ctx = fixture();
+    ctx.start.mockReturnValueOnce(handle([
+      { ...rejection, num_turns: 0, errors: ['invalid model name'], result: 'invalid model name' },
+    ])).mockReturnValueOnce(handle([success]));
+    const result = await ctx.bridge.executeApiTask({ chatId: 'chat', prompt: 'work' });
+    expect(result.success).toBe(true);
+    expect(ctx.start).toHaveBeenCalledTimes(2);
+    expect(ctx.manager.getSession('chat').model).toBeUndefined();
+  });
+
   it('does not classify assistant prose as a provider rejection', async () => {
     const ctx = fixture(); ctx.start.mockReturnValueOnce(handle([{ ...success, result: 'The requested model does not exist in this documentation.' }]));
     const result = await ctx.bridge.executeApiTask({ chatId: 'chat', prompt: 'work' });
