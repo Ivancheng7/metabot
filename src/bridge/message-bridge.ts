@@ -1674,7 +1674,8 @@ export class MessageBridge {
               if (rejection) {
                 providerFailure = message.errors?.join('; ') || message.result || `Ended with: ${message.subtype}`;
                 if ((message.num_turns ?? 0) > 0 || Object.values(message.modelUsage ?? {}).some(usage => usage.outputTokens > 0)
-                  || (message.result && !/^API Error:\s*\d{3}\s/i.test(message.result))) task.executionStarted = true;
+                  || (message.result && !/^API Error:\s*\d{3}\s/i.test(message.result)
+                    && !isUnknownModelError(message.result))) task.executionStarted = true;
               } else if (!(message.type === 'system' && message.subtype === 'init')) task.executionStarted = true;
               yield message;
             }
@@ -1696,7 +1697,8 @@ export class MessageBridge {
       await task.rateLimiter.cancelAndWait();
       const unknownModel = outcome.kind === 'provider-failure' && isUnknownModelError(outcome.errorMessage);
       const retryModel = unknownModel && request.selected.policy.kind === 'named' && !task.executionStarted;
-      const retrySession = outcome.kind === 'provider-failure' && !unknownModel && request.options.resume?.sessionId
+      const retrySession = outcome.kind === 'provider-failure' && !unknownModel && !task.executionStarted
+        && request.options.resume?.sessionId
         && (isStaleSessionError(outcome.errorMessage) || isContextOverflowError(outcome.errorMessage));
       if (attempt === 0 && active() && (retryModel || retrySession)) {
         previousCost = outcome.state.costUsd;
