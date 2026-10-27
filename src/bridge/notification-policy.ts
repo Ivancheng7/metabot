@@ -22,7 +22,7 @@ export async function sendCompletionNotice(opts: {
   const { sender, config, logger, chatId, state, durationMs } = opts;
 
   if (sender.skipCompletionNotice) return;
-  if (hasRunningBackgroundWork(state)) return;
+  if (state.status === 'complete' && hasRunningBackgroundWork(state)) return;
   if (state.status === 'complete' && isVoiceReplyEnabled(config)) return;
   if (durationMs < COMPLETION_NOTICE_MIN_DURATION_MS) return;
 

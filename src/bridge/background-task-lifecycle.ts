@@ -2,9 +2,11 @@ import type { CardState } from '../types.js';
 
 export type ActivityLifecycleType = 'task_waiting' | 'task_completed' | 'task_failed';
 
-/** True while the turn has spawned background work that has not finished yet. */
 export function hasRunningBackgroundWork(state: CardState): boolean {
-  return state.backgroundEvents?.some((event) => event.status === 'running') === true;
+  return state.hasRunningBackgroundWork
+    ?? (state.backgroundEvents?.some((event) => event.kind === 'work' && event.status === 'running') === true
+      || state.teamState?.tasks.some((task) => task.status === 'in_progress') === true
+      || state.teamState?.teammates.some((member) => member.status === 'working') === true);
 }
 
 export function activityTypeForState(state: CardState): ActivityLifecycleType {

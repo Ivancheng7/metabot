@@ -14,7 +14,10 @@ export type AuditEvent =
   | 'auth_denied'
   | 'api_task_start'
   | 'api_task_complete'
-  | 'api_task_waiting';
+  | 'api_task_waiting'
+  | 'api_task_error'
+  | 'api_task_timeout'
+  | 'api_task_idle_timeout';
 
 export interface AuditEntry {
   event: AuditEvent;

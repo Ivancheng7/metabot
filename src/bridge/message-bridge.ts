@@ -132,6 +132,7 @@ interface RunningTask {
   sendCards: boolean;
   /** Live snapshot of the active Agent Team, accumulated from team hooks. */
   teamState?: TeamState;
+  teamHasRunningWork?: boolean;
 }
 
 interface StartingTask {
@@ -1374,6 +1375,7 @@ export class MessageBridge {
         }
       }
 
+      lastState = this.resolveFinalState(lastState, chatId);
       await this.sendFinalCard(messageId, lastState, chatId);
       // Intentionally NO sendCompletionNotice here. Continuation turns are
       // between-turn agent activity the user didn't initiate — the card
@@ -1386,11 +1388,11 @@ export class MessageBridge {
       await this.outputHandler.sendOutputFiles(chatId, outputsDir, processor, lastState);
     } catch (err: any) {
       this.logger.error({ err, chatId }, 'MessageBridge: continuation stream errored');
-      const errorState: CardState = {
+      const errorState = this.resolveFinalState({
         ...lastState,
         status: 'error',
         errorMessage: err?.message || 'Continuation failed',
-      };
+      }, chatId);
       try { await rateLimiter.cancelAndWait(); } catch { /* ignore */ }
       try { await this.sendFinalCard(messageId, errorState, chatId); } catch { /* ignore */ }
     } finally {
@@ -1630,25 +1632,40 @@ export class MessageBridge {
     return true;
   }
 
+  private resolveFinalState(state: CardState, chatId: string): CardState {
+    const task = this.runningTasks.get(chatId);
+    const enriched = this.enrichWithAgentTeams({
+      ...state,
+      teamState: task?.teamState ?? state.teamState,
+    }, chatId);
+    return { ...enriched, hasRunningBackgroundWork: hasRunningBackgroundWork(enriched) };
+  }
+
   private enrichWithAgentTeams(state: CardState, chatId?: string): CardState {
-    if (!this.agentTeamStore) return state;
+    const task = chatId ? this.runningTasks.get(chatId) : undefined;
+    const knownState = task?.teamHasRunningWork
+      ? { ...state, hasRunningBackgroundWork: true }
+      : state;
+    if (!this.agentTeamStore) return knownState;
     // During shutdown the store may already be closed while a turn is still
     // finalizing its card. Enrichment is auxiliary — never let it fail the turn.
     try {
-      if (this.agentTeamStore.isClosed()) return state;
+      if (this.agentTeamStore.isClosed()) return knownState;
       const team = chatId ? this.agentTeamStore.findTeamForChat(chatId) : undefined;
-      if (!team) return state;
+      if (!team) return knownState;
       const snapshot = this.agentTeamStore.status(team.name);
-      if (!snapshot) return state;
+      if (!snapshot) return knownState;
       const mapped = buildAgentTeamCardSnapshot(snapshot);
+      if (task) task.teamHasRunningWork = mapped.hasRunningBackgroundWork;
       return {
         ...state,
+        hasRunningBackgroundWork: mapped.hasRunningBackgroundWork || hasRunningBackgroundWork(state),
         teamState: hasTeamState(state.teamState) ? state.teamState : mapped.teamState,
         backgroundEvents: mergeBackgroundEvents(state.backgroundEvents, mapped.backgroundEvents),
       };
     } catch (err) {
-      this.logger.warn({ err, chatId }, 'enrichWithAgentTeams failed; rendering card without team state');
-      return state;
+      this.logger.warn({ err, chatId }, 'enrichWithAgentTeams failed; preserving known work state');
+      return knownState;
     }
   }
 
@@ -2777,6 +2794,7 @@ export class MessageBridge {
         await rateLimiter.cancelAndWait();
       }
 
+      lastState = this.resolveFinalState(lastState, chatId);
       await this.sendFinalCard(messageId, lastState, chatId);
 
       // Audit + cost tracking
@@ -2860,6 +2878,7 @@ export class MessageBridge {
             rateLimiter.schedule(() => { this.sender.updateCard(messageId, this.enrichWithAgentTeams(state, chatId)); });
           }
           await rateLimiter.cancelAndWait();
+          lastState = this.resolveFinalState(lastState, chatId);
           await this.sendFinalCard(messageId, lastState, chatId);
 
           const durationMs = Date.now() - startTime;
@@ -2916,13 +2935,12 @@ export class MessageBridge {
       metrics.incCounter('metabot_tasks_total');
       metrics.incCounter('metabot_tasks_by_status', 'error');
 
-      const errorState: CardState = {
+      const errorState = this.resolveFinalState({
+        ...lastState,
         status: 'error',
         userPrompt: displayPrompt,
-        responseText: lastState.responseText,
-        toolCalls: lastState.toolCalls,
         errorMessage: err.message || 'Unknown error',
-      };
+      }, chatId);
       await rateLimiter.cancelAndWait();
       await this.sendFinalCard(messageId, errorState, chatId);
     } finally {
@@ -3267,6 +3285,7 @@ export class MessageBridge {
         await rateLimiter.cancelAndWait();
       }
 
+      lastState = this.resolveFinalState(lastState, chatId);
       if (sendCards && messageId) {
         await this.sendFinalCard(messageId, lastState, chatId);
       }
@@ -3282,7 +3301,11 @@ export class MessageBridge {
 
       const durationMs = Date.now() - startTime;
       this.audit.log({
-        event: hasRunningBackgroundWork(lastState) ? 'api_task_waiting' : 'api_task_complete', botName: this.config.name, chatId, userId, prompt,
+        event: timedOut ? 'api_task_timeout'
+          : idledOut ? 'api_task_idle_timeout'
+          : lastState.status === 'error' ? 'api_task_error'
+          : hasRunningBackgroundWork(lastState) ? 'api_task_waiting' : 'api_task_complete',
+        botName: this.config.name, chatId, userId, prompt,
         durationMs, costUsd: lastState.costUsd, error: lastState.errorMessage,
       });
       this.emitActivity({
@@ -3346,6 +3369,7 @@ export class MessageBridge {
           }
           await rateLimiter.cancelAndWait();
 
+          lastState = this.resolveFinalState(lastState, chatId);
           if (sendCards && messageId) {
             await this.sendFinalCard(messageId, lastState, chatId);
           }
@@ -3372,25 +3396,16 @@ export class MessageBridge {
         }
       }
 
-      if (sendCards && messageId) {
-        const errorState: CardState = {
-          status: 'error',
-          userPrompt: displayPrompt,
-          responseText: lastState.responseText,
-          toolCalls: lastState.toolCalls,
-          errorMessage: err.message || 'Unknown error',
-        };
-        await rateLimiter.cancelAndWait();
-        await this.sendFinalCard(messageId, errorState, chatId);
-      }
-
-      const catchErrorState: CardState = {
+      const catchErrorState = this.resolveFinalState({
+        ...lastState,
         status: 'error',
         userPrompt: displayPrompt,
-        responseText: lastState.responseText,
-        toolCalls: lastState.toolCalls,
         errorMessage: err.message || 'Unknown error',
-      };
+      }, chatId);
+      if (sendCards && messageId) {
+        await rateLimiter.cancelAndWait();
+        await this.sendFinalCard(messageId, catchErrorState, chatId);
+      }
       options.onUpdate?.(catchErrorState, effectiveMessageId, true);
 
       this.emitActivity({
@@ -3431,7 +3446,7 @@ export class MessageBridge {
       logger: this.logger,
       sessionManager: this.sessionManager,
       messageId,
-      state: this.enrichWithAgentTeams(state, chatId),
+      state,
       chatId,
     });
   }
