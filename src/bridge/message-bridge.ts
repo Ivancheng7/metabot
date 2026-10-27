@@ -4,12 +4,12 @@ import * as path from 'node:path';
 import type { BotConfigBase } from '../config.js';
 import { modelName, resolveModelPolicy, type ModelPolicy } from '../engines/model-policy.js';
 import type { ExecutorOptions } from '../engines/claude/executor.js';
-import type { ModelPreferenceSelection } from '../engines/claude/session-manager.js';
 import type { Logger } from '../utils/logger.js';
 import type { BackgroundEvent, IncomingMessage, CardState, PendingQuestion, TeamState, TeamMember, TeamTask } from '../types.js';
 import type { IMessageSender } from './message-sender.interface.js';
 import type { DocSync } from '../sync/doc-sync.js';
 import type {
+  ModelPreferenceSelection,
   Engine,
   Executor,
   ExecutionHandle,
