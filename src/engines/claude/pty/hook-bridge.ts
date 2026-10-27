@@ -2,10 +2,10 @@
  * PTY backend — hook bridge.
  *
  * In SDK mode, hooks are JS callbacks invoked in-process. In PTY mode the
- * spawned `claude` runs hooks as shell `command`s defined in --settings json.
+ * spawned `claude` runs command hooks defined in --settings json.
  * This bridge:
- *   1. Generates a settings.json with command hooks pointing at small shell
- *      snippets that write sentinel/event files.
+ *   1. Generates a settings.json with exec-form sentinel hooks and optional
+ *      shell commands that write team events.
  *   2. Watches the Stop sentinel to fire `onTurnComplete`.
  *   3. Tails the team-event file to fire `onTeamEvent`.
  *
@@ -74,33 +74,13 @@ export function buildPostCompactHook(
   return { type: 'command', command: nodePath, args: ['-e', script, Buffer.from(compactPath).toString('hex')] };
 }
 
-/**
- * Build the `Stop` hook command that writes the sentinel file.
- *
- * The hook runs through the shell, so the command has to exist on the host OS:
- *
- *   - `cat` is not available on Windows, where hooks are executed by `cmd` —
- *     the command fails, the sentinel is never written, and the PTY watcher
- *     waits forever for a turn that already finished.
- *   - An unquoted path breaks as soon as the temp dir contains a space (the OS
- *     temp dir commonly does). Quoting also keeps shell metacharacters in the
- *     path from being interpreted.
- *
- * The hook receives its JSON payload on stdin; the sentinel only has to change
- * for the watcher to fire, so the payload itself is not needed.
- */
-export function buildStopHookCommand(
+export function buildStopHook(
   sentinelPath: string,
-  platform: NodeJS.Platform = process.platform,
-): string {
-  if (platform === 'win32') {
-    // PowerShell single-quoted strings escape ' by doubling it.
-    const escapedPath = sentinelPath.replace(/'/g, "''");
-    return `powershell.exe -NoProfile -NonInteractive -Command "Set-Content -LiteralPath '${escapedPath}' -Value stop -Encoding UTF8"`;
-  }
-  // POSIX: close the single-quoted string, append an escaped quote, reopen.
-  const escapedPath = sentinelPath.replace(/'/g, `'"'"'`);
-  return `cat > '${escapedPath}'`;
+  nodePath: string = process.execPath,
+): ExecCommandHook {
+  const script = "const f=require('fs');let d='';try{d=f.readFileSync(0)}catch{}"
+    + "f.writeFileSync(Buffer.from(process.argv[1],'hex').toString(),d.length?d:'stop')";
+  return { type: 'command', command: nodePath, args: ['-e', script, Buffer.from(sentinelPath).toString('hex')] };
 }
 
 /**
@@ -131,17 +111,9 @@ export function createHookBridge(options?: HookBridgeOptions): PtyHookBridge {
   // ── writeSettings ────────────────────────────────────────────────────────
 
   async function writeSettings(): Promise<string> {
-    // Stop hook: Claude pipes hook JSON on stdin to the command, which writes
-    // the sentinel file the watcher below polls.
-    const stopCommand = buildStopHookCommand(sentinelPath);
-
     const hooks: Record<string, unknown> = {
       PostCompact: [{ matcher: 'manual', hooks: [buildPostCompactHook(compactPath)] }],
-      Stop: [
-        {
-          hooks: [{ type: 'command', command: stopCommand }],
-        },
-      ],
+      Stop: [{ hooks: [buildStopHook(sentinelPath)] }],
     };
 
     // phase 2: team-event hooks are rejected by the current claude CLI
