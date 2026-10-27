@@ -26,6 +26,8 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** Max bytes kept in the PTY output ring buffer. */
 const RING_CAP = 64 * 1024;
+/** Marks steering text so a withdrawn paste can be recognized in the composer. */
+const STEER_PREFIX = '用户补充要求：';
 
 class PtyClaudeSessionImpl implements IPtyClaudeSession {
   readonly sessionId: string;
@@ -45,6 +47,11 @@ class PtyClaudeSessionImpl implements IPtyClaudeSession {
   private readonly rows: number;
   private readyPromise: Promise<void> | null = null;
   private disposed = false;
+  // Composer writes are serialized: a steer in flight finishes (submits or
+  // clears its text) before a new prompt is typed, and never interleaves
+  // keys with an interrupt's ESC/Ctrl-C.
+  private steering: Promise<unknown> | null = null;
+  private interrupting: Promise<void> | null = null;
   private readonly log: Logger;
   private readonly opts: PtyClaudeSessionOptions;
 
@@ -215,8 +222,63 @@ class PtyClaudeSessionImpl implements IPtyClaudeSession {
     );
   }
 
+  async steerPrompt(text: string, isCurrent: () => boolean = () => true): Promise<boolean> {
+    const run = this.submitSteer(text, isCurrent);
+    this.steering = run;
+    try { return await run; }
+    finally { if (this.steering === run) this.steering = null; }
+  }
+
+  private async submitSteer(text: string, isCurrent: () => boolean): Promise<boolean> {
+    // Do not wait for idle: that would turn steering into a next-turn message.
+    if (!this.term || this.disposed) throw new Error('Claude session is closed');
+    if (!isCurrent()) return false;
+    const screen = this.screen();
+    const sq = screen.toLowerCase().replace(/\s+/g, '');
+    if (!screen.includes('❯') || sq.includes('entertoselect') || sq.includes('shift+tabtoapprove')
+        || /❯\d\./.test(sq)) throw new Error('Claude is not accepting composer input');
+    // A single bracketed paste prevents newlines/control keys from submitting
+    // commands or selecting menu entries. Prefix makes leading slashes plain text.
+    // eslint-disable-next-line no-control-regex -- strip terminal control bytes from user input
+    const safe = text.replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+    this.term.write('\x1b[200~' + STEER_PREFIX + '\n' + safe + '\x1b[201~');
+    await sleep(100);
+    if (!this.term || this.disposed) throw new Error('Claude session closed while submitting input');
+    // The turn may have ended or been interrupted while the paste landed.
+    // Enter now would start an untracked turn, so withdraw the text instead.
+    if (!isCurrent()) {
+      await this.clearComposer(safe.split('\n').length + 1);
+      return false;
+    }
+    this.term.write('\r');
+    return true;
+  }
+
+  /**
+   * Erase unsubmitted composer text. Uses Ctrl-U (delete to line start) plus
+   * Backspace (join with the previous line) per line — both no-ops on an
+   * empty composer — rather than Ctrl-C, whose second press exits claude.
+   */
+  private async clearComposer(lines: number): Promise<void> {
+    while (this.interrupting) await this.interrupting;
+    if (!this.term || this.disposed) return;
+    this.term.write('\x15\x7f'.repeat(lines) + '\x15');
+    await sleep(100);
+    if (this.composerText().includes(STEER_PREFIX)) {
+      this.log.warn('pty-session: withdrawn steer text still visible in composer');
+    }
+  }
+
+  /** Text on the screen from the last `❯` input line down (the live composer). */
+  private composerText(): string {
+    const screen = this.screen();
+    const at = screen.lastIndexOf('❯');
+    return at < 0 ? '' : screen.slice(at);
+  }
+
   async typePrompt(text: string): Promise<void> {
     await this.ready(); // boot: wait for the TUI to first come up
+    while (this.steering) await this.steering.catch(() => {});
     // Per-call readiness: ready() is memoized after boot, so on its own it would
     // let us type the INSTANT a turn is requested — even while claude is still
     // mid-interrupt. That's the "no response" bug: after a keep-planning Esc
@@ -288,11 +350,16 @@ class PtyClaudeSessionImpl implements IPtyClaudeSession {
 
   async interrupt(): Promise<void> {
     if (!this.term || this.disposed) return;
-    this.log.info('pty-session: sending interrupt (ESC + Ctrl-C)');
-    this.term.write('\x1b');
-    await sleep(100);
-    this.term.write('\x03');
-    await sleep(100);
+    const run = (async () => {
+      this.log.info('pty-session: sending interrupt (ESC + Ctrl-C)');
+      this.term?.write('\x1b');
+      await sleep(100);
+      this.term?.write('\x03');
+      await sleep(100);
+    })();
+    this.interrupting = run;
+    try { await run; }
+    finally { if (this.interrupting === run) this.interrupting = null; }
   }
 
   /**

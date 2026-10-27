@@ -7,6 +7,7 @@ export interface ApiContext {
   engine?: 'claude' | 'kimi' | 'codex';
   /** Current engine session id when one already exists; diagnostic only. */
   sessionId?: string;
+  busSessionId?: string;
   /** Compact current Team roster and dispatch hint; never includes task/message/run history. */
   teamContext?: string;
   /** Group chat member names — enables inter-bot communication prompt. */
@@ -24,6 +25,9 @@ function compactContextValue(value: string | undefined, fallback: string): strin
 export function buildMetaBotApiPromptContext(apiContext: ApiContext): string {
   const botName = compactContextValue(apiContext.botName, 'metabot');
   const chatId = compactContextValue(apiContext.chatId, 'unknown');
+  const senderSessionHint = apiContext.busSessionId
+    ? ` --sender-session ${compactContextValue(apiContext.busSessionId, '')}`
+    : '';
   const sessionId = apiContext.sessionId
     ? compactContextValue(apiContext.sessionId, 'unknown')
     : 'not established yet (a new Session will be created automatically)';
@@ -44,5 +48,8 @@ export function buildMetaBotApiPromptContext(apiContext: ApiContext): string {
     `- Recurring: \`metabot schedule cron ${botName} ${chatId} "<cronExpr>" "<prompt>"\``,
     '',
     'Use the /metabot skill for Memory, T5T, Agent Bus, Agent Teams, scheduling, and runtime operations.',
+    ...(senderSessionHint
+      ? [`Agent Bus: use \`metabot send <agent> "<message>"${senderSessionHint}\` to return results here; use \`--implicit\` for background work. Child-direct card delivery requires explicit \`--child-direct\`.`]
+      : ['Agent Bus: use `metabot send <agent> "<message>" --implicit` for background work; do not invent a Feishu origin chat.']),
   ].join('\n');
 }

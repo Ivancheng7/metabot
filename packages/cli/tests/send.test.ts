@@ -10,6 +10,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   process.env = { ...ORIG_ENV };
 });
 
@@ -87,7 +88,87 @@ describe('metabot send', () => {
         originChatId: 'oc_origin_chat',
         originBotName: 'metabot',
       },
-      { agentId: 'superagent', message: 'direct' },
+      { agentId: 'superagent', message: 'direct', presentationMode: 'child-direct' },
     ]);
+  });
+
+  it('lists sessions and reads history using encoded pagination queries', async () => {
+    const fetchMock = vi.fn(
+      async (_url: unknown, _init?: RequestInit) =>
+        new Response(JSON.stringify({ sessions: [], messages: [] }), { status: 200 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+    const mod = await importFresh();
+    await mod.run(['sessions', 'agent/with space', '--limit', '3', '--offset', '2']);
+    await mod.run(['history', 'session/?', '--limit', '5', '--before', 'message/&']);
+    const list = new URL(String(fetchMock.mock.calls[0]![0]));
+    expect(list.pathname).toBe('/core/api/messages/sessions');
+    expect(Object.fromEntries(list.searchParams)).toEqual({ agentId: 'agent/with space', limit: '3', offset: '2' });
+    const history = new URL(String(fetchMock.mock.calls[1]![0]));
+    expect(history.pathname).toBe('/core/api/messages/history');
+    expect(Object.fromEntries(history.searchParams)).toEqual({
+      sessionId: 'session/?',
+      limit: '5',
+      before: 'message/&',
+    });
+    expect(fetchMock.mock.calls[0]![1]).toMatchObject({ headers: { Authorization: 'Bearer mt_test_tok' } });
+  });
+
+  it('prints session candidates on conflicts without partial success output', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              error: 'session_required',
+              sessions: [{ id: 's1', status: 'resumable', title: 'First task', updatedAt: 'now' }],
+            }),
+            { status: 409 },
+          ),
+      ),
+    );
+    const stdout = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+    const mod = await importFresh();
+    await expect(mod.run(['target', 'hello'])).rejects.toThrow('s1  resumable  now  First task');
+    expect(stdout).not.toHaveBeenCalled();
+  });
+
+  it('forwards sender-session and prioritizes implicit over child-direct', async () => {
+    const fetchMock = vi.fn(async (_url: unknown, _init?: RequestInit) => new Response('{}', { status: 202 }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+    const mod = await importFresh();
+    await mod.run(['target', 'hello', '--sender-session', 'sender-live', '--implicit', '--child-direct']);
+    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]?.body))).toEqual({
+      agentId: 'target',
+      message: 'hello',
+      senderSessionId: 'sender-live',
+      presentationMode: 'implicit',
+    });
+  });
+
+  it('preserves the public local Core default for session reads', async () => {
+    delete process.env.METABOT_CORE_URL;
+    delete process.env.METABOT_CORE_AGENT_BUS_URL;
+    const fetchMock = vi.fn(async (_url: unknown) => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+    const mod = await importFresh();
+    await mod.run(['sessions', 'target']);
+    expect(String(fetchMock.mock.calls[0]![0])).toBe('http://localhost:9200/api/messages/sessions?agentId=target');
+  });
+
+  it.each(['sessions', 'history'])('reports %s request errors and requires an identifier', async (command) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('not authorized', { status: 403 })),
+    );
+    const stdout = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+    const mod = await importFresh();
+    await expect(mod.run([command])).rejects.toThrow('required');
+    await expect(mod.run([command, 'identifier'])).rejects.toThrow('403: not authorized');
+    expect(stdout).not.toHaveBeenCalled();
   });
 });

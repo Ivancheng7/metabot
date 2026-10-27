@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   api,
   ApiError,
@@ -16,21 +16,18 @@ import {
 } from '../lib/api';
 import { formatAbsolute, formatRelative } from '../lib/format';
 import { renderMarkdown } from '../lib/render-markdown';
+import BusSessionList from '../components/chat/BusSessionList';
+import { BusSessionHistoryView } from '../components/chat/BusSessionHistoryView';
+import {
+  applyModelCommand,
+  COMMON_MODELS,
+  ENGINE_OPTIONS,
+  loadModelChoice,
+  saveModelChoice as persistModelChoice,
+  type ChatEngine,
+} from '../components/chat/model-command';
 
 const REFRESH_MS = 1_200;
-type ChatEngine = 'claude' | 'kimi' | 'codex';
-
-const ENGINE_OPTIONS: Array<{ value: ChatEngine; label: string; defaultModel: string }> = [
-  { value: 'claude', label: 'Claude', defaultModel: '' },
-  { value: 'codex', label: 'Codex', defaultModel: '' },
-  { value: 'kimi', label: 'Kimi', defaultModel: '' },
-];
-
-const COMMON_MODELS: Record<ChatEngine, string[]> = {
-  claude: ['', 'claude-fable-5', 'claude-opus-4-8', 'claude-sonnet-4-6'],
-  codex: ['', 'gpt-5.5', 'gpt-5.5-codex', 'gpt-5.2-codex'],
-  kimi: ['', 'kimi-for-coding', 'kimi-k2'],
-};
 
 interface TimelineRun {
   id: string;
@@ -140,37 +137,8 @@ function runStatusLabel(status: ChatRunStatus): string {
   return status.replace('_', ' ');
 }
 
-function modelStorageKey(conversationId: string): string {
-  return `metabot-core-chat-model:${conversationId}`;
-}
-
-function loadModelChoice(conversationId: string): { engine: ChatEngine; model: string } {
-  try {
-    const raw = window.localStorage.getItem(modelStorageKey(conversationId));
-    if (!raw) return { engine: 'codex', model: '' };
-    const parsed = JSON.parse(raw) as { engine?: string; model?: string };
-    const engine = parsed.engine === 'codex' || parsed.engine === 'kimi' || parsed.engine === 'claude'
-      ? parsed.engine
-      : 'codex';
-    return { engine, model: typeof parsed.model === 'string' ? parsed.model : '' };
-  } catch {
-    return { engine: 'codex', model: '' };
-  }
-}
-
 function saveModelChoice(conversationId: string, engine: ChatEngine, model: string): void {
-  window.localStorage.setItem(modelStorageKey(conversationId), JSON.stringify({ engine, model }));
-}
-
-function parseModelCommand(content: string): { engine?: ChatEngine; model?: string; reset?: boolean } | null {
-  const match = content.trim().match(/^\/model(?:\s+(.+))?$/i);
-  if (!match) return null;
-  const arg = (match[1] || '').trim();
-  if (!arg || arg === 'list') return {};
-  const normalized = arg.toLowerCase();
-  if (normalized === 'reset' || normalized === 'clear' || normalized === 'default') return { reset: true };
-  if (normalized === 'claude' || normalized === 'kimi' || normalized === 'codex') return { engine: normalized };
-  return { model: arg.split(/\s+/)[0] };
+  persistModelChoice(conversationId, { engine, model });
 }
 
 function eventType(event: ChatRunEvent): string {
@@ -1144,6 +1112,60 @@ function Composer({
 }
 
 export function Chat() {
+  const [params, setParams] = useSearchParams();
+  const agent = params.get('agent');
+  const sessionId = params.get('session');
+  const [error, setError] = useState<string | null>(null);
+  const [opening, setOpening] = useState(false);
+  const openRequest = useRef(0);
+
+  useEffect(() => {
+    openRequest.current++;
+    setError(null);
+    setOpening(false);
+    return () => { openRequest.current++; };
+  }, [agent, sessionId]);
+
+  if (!agent) return <PersonalChat />;
+  if (sessionId) {
+    return (
+      <BusSessionHistoryView
+        key={`${agent}:${sessionId}`}
+        agent={agent}
+        sessionId={sessionId}
+        onBack={() => setParams({ agent })}
+      />
+    );
+  }
+
+  const startAgentDm = async () => {
+    if (opening) return;
+    const request = ++openRequest.current;
+    setOpening(true);
+    try {
+      const conversation = await api.findOrCreateAgentDm(agent);
+      if (openRequest.current === request) setParams({ c: conversation.id });
+    } catch {
+      if (openRequest.current === request) setError(`无法打开与 ${agent} 的会话`);
+    } finally {
+      if (openRequest.current === request) setOpening(false);
+    }
+  };
+
+  return (
+    <>
+      {error && <p role="alert">{error}</p>}
+      <BusSessionList
+        agent={agent}
+        onBack={() => setParams({})}
+        onSelect={(session) => setParams({ agent, session: session.id })}
+        onNewSession={() => void startAgentDm()}
+      />
+    </>
+  );
+}
+
+function PersonalChat() {
   const [conversations, setConversations] = useState<ChatConversation[] | null>(null);
   const [availableAgents, setAvailableAgents] = useState<AgentSummary[]>([]);
   const [selected, setSelected] = useState<ChatConversation | null>(null);
@@ -1314,13 +1336,11 @@ export function Chat() {
 
   const send = async (content: string, mentionedAgentRefs: string[]) => {
     if (!selected) return;
-    const command = parseModelCommand(content);
-    if (command) {
-      const nextEngine = command.reset ? 'codex' : command.engine || engine;
-      const nextModel = command.reset || command.engine ? '' : command.model ?? model;
-      setEngine(nextEngine);
-      setModel(nextModel);
-      saveModelChoice(selected.id, nextEngine, nextModel);
+    const choice = applyModelCommand({ engine, model }, content);
+    if (choice) {
+      setEngine(choice.engine);
+      setModel(choice.model);
+      saveModelChoice(selected.id, choice.engine, choice.model);
       return;
     }
     const cleanModel = model.trim();

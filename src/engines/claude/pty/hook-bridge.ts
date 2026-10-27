@@ -40,6 +40,40 @@ export interface HookBridgeOptions {
   teamEvents?: boolean;
 }
 
+/** A command hook in Claude Code's exec form (`args` present → no shell). */
+export interface ExecCommandHook {
+  type: 'command';
+  command: string;
+  args: string[];
+}
+
+/**
+ * Build the `PostCompact` hook that writes the compaction sentinel.
+ *
+ * `/compact` waits exclusively for this sentinel, so the hook must not depend
+ * on how any shell parses the temp path:
+ *
+ *   - Exec form (`args`, Claude Code ≥ 2.1.139) spawns the executable directly
+ *     on every platform — no `sh`, Git Bash, PowerShell or cmd — so spaces,
+ *     quotes, `$`, backticks and `%` in either path are never interpreted.
+ *   - `command` is the current Node binary, a real executable on Windows too,
+ *     instead of `cat`.
+ *   - The sentinel path is passed hex-encoded: exec form still substitutes
+ *     `${CLAUDE_PROJECT_DIR}`-style placeholders inside `args`, and hex cannot
+ *     contain one.
+ *
+ * The hook JSON arrives on stdin and is copied into the sentinel; the watcher
+ * only needs the file to change.
+ */
+export function buildPostCompactHook(
+  compactPath: string,
+  nodePath: string = process.execPath,
+): ExecCommandHook {
+  const script = "const f=require('fs');let d='';try{d=f.readFileSync(0)}catch{}"
+    + "f.writeFileSync(Buffer.from(process.argv[1],'hex').toString(),d.length?d:'compact')";
+  return { type: 'command', command: nodePath, args: ['-e', script, Buffer.from(compactPath).toString('hex')] };
+}
+
 /**
  * Build the `Stop` hook command that writes the sentinel file.
  *
@@ -81,10 +115,12 @@ export function createHookBridge(options?: HookBridgeOptions): PtyHookBridge {
   mkdirSync(bridgeDir, { recursive: true });
 
   const sentinelPath = join(bridgeDir, 'stop.flag');
+  const compactPath = join(bridgeDir, 'compact.flag');
   const teamEventPath = join(bridgeDir, 'team-events.jsonl');
   const settingsPath = join(bridgeDir, 'settings.json');
 
   let turnCb: (() => void) | null = null;
+  let compactCb: (() => void) | null = null;
   let teamCb: ((event: { kind: string; payload: unknown }) => void) | null = null;
 
   let sentinelWatcher: FSWatcher | null = null;
@@ -100,6 +136,7 @@ export function createHookBridge(options?: HookBridgeOptions): PtyHookBridge {
     const stopCommand = buildStopHookCommand(sentinelPath);
 
     const hooks: Record<string, unknown> = {
+      PostCompact: [{ matcher: 'manual', hooks: [buildPostCompactHook(compactPath)] }],
       Stop: [
         {
           hooks: [{ type: 'command', command: stopCommand }],
@@ -125,7 +162,16 @@ export function createHookBridge(options?: HookBridgeOptions): PtyHookBridge {
       ];
     }
 
-    const settings = { hooks };
+    // The PTY is always launched with --dangerously-skip-permissions. Claude
+    // Code otherwise blocks its first unattended run behind an interactive
+    // acknowledgement screen, so record the matching settings acknowledgement
+    // in this ephemeral file. This does not grant anything beyond the launch
+    // flag; it only prevents the already-selected mode from hanging startup.
+    const settings = {
+      permissions: { defaultMode: 'bypassPermissions' },
+      skipDangerousModePermissionPrompt: true,
+      hooks,
+    };
 
     writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
     return settingsPath;
@@ -147,6 +193,10 @@ export function createHookBridge(options?: HookBridgeOptions): PtyHookBridge {
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
     sentinelWatcher = watch(watchDir, (eventType, filename) => {
+      if (filename === 'compact.flag') {
+        if (compactCb && !disposed) compactCb();
+        return;
+      }
       if (filename !== 'stop.flag') return;
       // Debounce — fs.watch can fire multiple events for a single write.
       if (debounceTimer) clearTimeout(debounceTimer);
@@ -244,6 +294,7 @@ export function createHookBridge(options?: HookBridgeOptions): PtyHookBridge {
   return {
     writeSettings,
     onTurnComplete,
+    onCompactComplete(cb) { compactCb = cb; startSentinelWatcher(); },
     onTeamEvent,
     dispose,
   };

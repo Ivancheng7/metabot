@@ -247,6 +247,7 @@ export interface ExecutorOptions {
   model?: string;
   /** Per-turn Codex reasoning effort override. Ignored by non-Codex executors. */
   reasoningEffort?: CodexReasoningEffort;
+  serviceTier?: 'fast' | 'flex' | 'default';
   /** Override allowed tools for this execution (empty array = no tools). */
   allowedTools?: string[];
   /** Called whenever Claude Code fires a team coordination hook. */

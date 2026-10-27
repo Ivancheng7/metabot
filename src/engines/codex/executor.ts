@@ -1,3 +1,5 @@
+import { startCodexCompaction } from './compaction.js';
+import { startAppServerRun, type AppServerRun } from './app-server.js';
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import os from 'node:os';
@@ -112,7 +114,8 @@ export function resolveCodexModelMetadata(codexConfig: CodexBotConfig, requested
     || codexConfig.model
     || codexConfig.displayModel
     || readCodexConfigModel(codexConfig.profile)
-    || readDefaultModelFromCache();
+    || readDefaultModelFromCache()
+    || 'gpt-6.1-sol';
   return {
     model,
     contextWindow: codexConfig.contextWindow ?? readContextWindowFromCache(model) ?? (model ? FALLBACK_CODEX_CONTEXT_WINDOW : undefined),
@@ -325,6 +328,7 @@ export function buildCodexArgs(
   sessionId: string | undefined,
   model: string | undefined,
   reasoningEffort?: CodexReasoningEffort,
+  serviceTier?: 'fast' | 'flex' | 'default',
 ): string[] {
   const args: string[] = [];
 
@@ -341,6 +345,8 @@ export function buildCodexArgs(
   if (codexConfig.baseUrl) args.push('-c', `openai_base_url=${tomlString(codexConfig.baseUrl)}`);
   const effectiveEffort = reasoningEffort ?? codexConfig.reasoningEffort;
   if (effectiveEffort) args.push('-c', `model_reasoning_effort=${tomlString(effectiveEffort)}`);
+  const tier = serviceTier ?? codexConfig.serviceTier;
+  if (tier) args.push('-c', `service_tier=${tomlString(tier)}`);
   for (const extraArg of codexConfig.extraArgs ?? []) args.push(extraArg);
 
   args.push('exec');
@@ -353,12 +359,66 @@ export function buildCodexArgs(
 }
 
 export class CodexExecutor {
+  private appServerRuns = new Map<string, AppServerRun>();
+
+  canSteer(chatId: string): boolean {
+    return this.appServerRuns.get(chatId)?.canSteer() ?? false;
+  }
+
+  async steer(chatId: string, prompt: string): Promise<'steered' | 'no-active-turn'> {
+    return this.appServerRuns.get(chatId)?.steer(prompt) ?? 'no-active-turn';
+  }
+
+  private startAppServer(options: ExecutorOptions): ExecutionHandle {
+    const config = this.config.codex ?? {};
+    const metadata = resolveCodexModelMetadata(config, options.model);
+    const args = buildCodexArgs(config, options.cwd, '', undefined, options.model ?? config.model, options.reasoningEffort, options.serviceTier);
+    const command = buildCodexSpawnCommand(resolveCodexPath(config.executable), [
+      ...args.slice(0, args.indexOf('exec')), 'app-server', '--listen', 'stdio://',
+    ]);
+    const run = startAppServerRun({
+      command: command.command, args: command.args, env: buildCodexEnv(config),
+      cwd: options.cwd, prompt: this.buildPromptWithContext(options.prompt, options.outputsDir, options.apiContext),
+      sessionId: options.sessionId, model: metadata.model, contextWindow: metadata.contextWindow,
+      effort: options.reasoningEffort ?? config.reasoningEffort,
+      serviceTier: options.serviceTier ?? config.serviceTier,
+      approvalPolicy: config.dangerouslyBypassApprovalsAndSandbox ? 'never' : config.approvalPolicy ?? 'never',
+      sandbox: config.dangerouslyBypassApprovalsAndSandbox ? 'danger-full-access' : config.sandbox ?? 'workspace-write',
+      signal: options.abortController.signal, logger: this.logger,
+    });
+    const chatId = options.apiContext?.chatId;
+    if (chatId) this.appServerRuns.set(chatId, run);
+    const finish = run.finish.bind(run);
+    run.finish = () => {
+      if (chatId && this.appServerRuns.get(chatId) === run) this.appServerRuns.delete(chatId);
+      finish();
+    };
+    return run;
+  }
+
+  compact(options: ExecutorOptions): ExecutionHandle {
+    if (!options.sessionId) throw new Error('No Codex session to compact');
+    const config = this.config.codex ?? {};
+    const args = buildCodexArgs(config, options.cwd, '', undefined, options.model ?? config.model, options.reasoningEffort);
+    const command = buildCodexSpawnCommand(resolveCodexPath(config.executable), [
+      ...args.slice(0, args.indexOf('exec')), 'app-server', '--listen', 'stdio://',
+    ]);
+    return startCodexCompaction({
+      command: command.command, args: command.args, env: buildCodexEnv(config),
+      cwd: options.cwd, sessionId: options.sessionId, model: options.model ?? config.model,
+      approvalPolicy: config.dangerouslyBypassApprovalsAndSandbox ? 'never' : config.approvalPolicy ?? 'never',
+      sandbox: config.dangerouslyBypassApprovalsAndSandbox ? 'danger-full-access' : config.sandbox ?? 'workspace-write',
+      signal: options.abortController.signal,
+    });
+  }
+
   constructor(
     private config: BotConfigBase,
     private logger: Logger,
   ) {}
 
   startExecution(options: ExecutorOptions): ExecutionHandle {
+    if (this.config.codex?.transport === 'app-server') return this.startAppServer(options);
     const { prompt, cwd, sessionId, abortController, outputsDir, apiContext } = options;
     const codexConfig = this.config.codex ?? {};
     const model = options.model ?? codexConfig.model;
@@ -369,7 +429,7 @@ export class CodexExecutor {
       model: modelMetadata.model,
       contextWindow: modelMetadata.contextWindow,
     });
-    const args = buildCodexArgs(codexConfig, cwd, fullPrompt, sessionId, model, options.reasoningEffort);
+    const args = buildCodexArgs(codexConfig, cwd, fullPrompt, sessionId, model ?? modelMetadata.model, options.reasoningEffort, options.serviceTier);
     const startTime = Date.now();
     let child: ChildProcess | undefined;
     let sawResult = false;
