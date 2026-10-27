@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageBridge } from '../src/bridge/message-bridge.js';
 import { ClaudeExecutor, type ExecutionHandle, type ExecutorOptions, type SDKMessage } from '../src/engines/claude/executor.js';
+import { CodexExecutor } from '../src/engines/codex/executor.js';
 import type { BotConfigBase } from '../src/config.js';
 vi.mock('../src/engines/claude/resolve-claude.js', () => ({ resolveClaudePath: () => 'claude-test' }));
 
@@ -95,6 +96,49 @@ describe('unknown-model canonical lifecycle', () => {
     expect(ctx.sender.updateCard.mock.calls.filter(([, state]) => ['complete', 'error'].includes(state.status))).toHaveLength(1);
     expectFinalized(ctx, false);
   });
+
+  it.each([
+    { surface: 'API', reasoningEffort: undefined, serviceTier: undefined },
+    { surface: 'chat', reasoningEffort: undefined, serviceTier: undefined },
+    { surface: 'API', reasoningEffort: 'low', serviceTier: 'flex' },
+    { surface: 'chat', reasoningEffort: 'low', serviceTier: 'flex' },
+  ] satisfies Array<{ surface: 'API' | 'chat' } & Pick<ExecutorOptions, 'reasoningEffort' | 'serviceTier'>>)(
+    '$surface keeps captured effort=$reasoningEffort and tier=$serviceTier through fallback until the next turn',
+    async ({ surface, reasoningEffort, serviceTier }) => {
+      const ctx = fixture();
+      ctx.config.engine = 'codex';
+      ctx.manager.setSessionEngine('chat', 'codex');
+      ctx.manager.setSessionModel('chat', 'retired', 'codex');
+      ctx.manager.setReasoningEffort('chat', reasoningEffort);
+      ctx.manager.setServiceTier('chat', serviceTier);
+      const start = vi.spyOn(CodexExecutor.prototype, 'startExecution')
+        .mockReturnValueOnce(handle([rejection], () => {
+          ctx.manager.setReasoningEffort('chat', 'high');
+          ctx.manager.setServiceTier('chat', 'fast');
+        }))
+        .mockReturnValueOnce(handle([success]))
+        .mockReturnValueOnce(handle([success]));
+      const run = async () => {
+        if (surface === 'chat') await ctx.chat();
+        else expect((await ctx.bridge.executeApiTask({ chatId: 'chat', prompt: 'work' })).success).toBe(true);
+      };
+
+      await run();
+      expect(start).toHaveBeenCalledTimes(2);
+      expect(start.mock.calls.map(([options]) => ({
+        reasoningEffort: options.reasoningEffort, serviceTier: options.serviceTier,
+      }))).toStrictEqual([
+        { reasoningEffort, serviceTier },
+        { reasoningEffort, serviceTier },
+      ]);
+      expect(start.mock.calls[1][0].modelPolicy).toEqual({ kind: 'endpoint-default' });
+      expect(ctx.manager.getSession('chat')).toMatchObject({ reasoningEffort: 'high', serviceTier: 'fast' });
+
+      await run();
+      expect(start).toHaveBeenCalledTimes(3);
+      expect(start.mock.calls[2][0]).toMatchObject({ reasoningEffort: 'high', serviceTier: 'fast' });
+    },
+  );
 
   it('keeps an unrelated stored preference when an API override fails', async () => {
     const ctx = fixture(); rejectFirst(ctx, 'result', handle([success]));
