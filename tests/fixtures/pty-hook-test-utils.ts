@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
+import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
@@ -10,7 +10,12 @@ export function createHostileRuntime(): { root: string; dir: string; nodePath: s
   const dir = join(root, "it's $HOOK_SUFFIX $(touch pwned) `touch pwned` %HOOK_SUFFIX% !1 ${CLAUDE_PROJECT_DIR}");
   mkdirSync(dir);
   const nodePath = join(dir, process.platform === 'win32' ? 'node.exe' : 'node');
-  copyFileSync(process.execPath, nodePath);
+  try {
+    linkSync(process.execPath, nodePath);
+  } catch (error) {
+    if (!(error instanceof Error) || !('code' in error) || error.code !== 'EXDEV') throw error;
+    copyFileSync(process.execPath, nodePath);
+  }
   return { root, dir, nodePath };
 }
 
