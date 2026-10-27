@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-10-26
+
+### Added
+
+- Added authorized Agent Bus session listing/history, readable titles, targeted sends, and non-chaining result notices back to the sender session. Child-direct transport delivery now requires explicit opt-in.
+- Added Agent → Bus session navigation, session composers, and poll-safe history pagination to the self-hosted Console.
+- Added explicitly authorized, goal-driven Feishu/Lark `/auto`, native session names in `/resume`, Codex effort/service-tier selection, and Kimi K3.1 Pro/highspeed model choices.
+- Added native `/append` and `/steer` mid-turn input for Codex app-server and Claude Code PTY, with turn-bound ownership and serialized composer writes (#427).
+- Added native `/compact` for idle Codex and Claude Code PTY sessions, preserving session identity and waiting for explicit completion signals (#428).
+
+### Changed
+
+- Added GPT 6.1 Sol as the Codex fallback while preserving explicit and local model configuration.
+
+### Fixed
+
+- Kept virtual API/team rooms from emitting transport cards and retried result notices while their origin session is busy.
+- Isolated Unix installation/update Node selection from agent-private runtimes and verified native SQLite/PTY bindings before restart.
+- Updated axios to 1.20.0, protobufjs to 7.6.6, and DOMPurify to 3.4.17 while preserving self-hosted authentication and public integration defaults.
+
+## [1.3.3] - 2026-10-25
+
+### Added
+
+- Added `/new` as a reset alias and `/?` as a help alias.
+- Added opt-outs for prompt/response persistence in the activity database and prompt persistence in audit logs.
+
+### Fixed
+
+- Preserved final response delivery when card updates are rate-limited by trying a replacement card before the text fallback.
+- Responded to bare Feishu bot mentions with a request to retrieve the current chat or topic context through user-managed Lark tooling.
+- Prevented Agent Teams card enrichment from failing in-flight turns when the store closes during shutdown.
+- Guarded connecting WebSocket termination and routed Feishu SDK diagnostics through credential-redacting logs.
+- Acknowledged the Claude PTY permission mode already selected by the launch flag so unattended startup can proceed.
+
 ## [1.3.2] - 2026-09-15
 
 ### Added

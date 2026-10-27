@@ -45,6 +45,7 @@ export interface IMessageSender {
 
   /** Send a plain text message. */
   sendText(chatId: string, text: string): Promise<void>;
+  sendTextAsUser?(chatId: string, text: string, idempotencyKey: string): Promise<string | undefined>;
 
   /** Send a local image file to the chat. */
   sendImageFile(chatId: string, filePath: string): Promise<boolean>;

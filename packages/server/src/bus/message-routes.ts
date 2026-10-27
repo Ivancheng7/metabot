@@ -2,7 +2,7 @@ import type * as http from 'node:http';
 import type { Credential } from '../auth/credentials.js';
 import type { AgentStore, AgentRecord } from '../agents/agent-store.js';
 import type { ChatStore } from '../chat/chat-store.js';
-import type { ChatRunPresentation } from '../chat/chat-types.js';
+import type { ChatMessage, ChatRun, ChatRunEvent, ChatRunPresentation } from '../chat/chat-types.js';
 import type { BusEventHub } from './event-hub.js';
 import { MessageStore, type MessageSession } from './message-store.js';
 
@@ -20,6 +20,7 @@ export interface MessageRouteDeps {
     engine?: string | null;
     model?: string | null;
     presentation?: ChatRunPresentation | null;
+    notification?: 'result' | 'error';
   }) => void;
 }
 export interface RouteResult {
@@ -46,6 +47,46 @@ function resolveAgent(store: AgentStore, ref: string, cred: Credential): AgentRe
 
 function sessionShape(s: MessageSession): MessageSession {
   return s;
+}
+
+function ownsAgent(agent: AgentRecord, cred: Credential): boolean {
+  return (
+    cred.role === 'admin' ||
+    agent.ownerCredentialId === cred.id ||
+    (!!cred.ownerName && agent.ownerName.toLowerCase() === cred.ownerName.toLowerCase())
+  );
+}
+
+function canAccessSession(
+  deps: MessageRouteDeps,
+  session: MessageSession,
+  agent: AgentRecord,
+  cred: Credential,
+): boolean {
+  if (session.agentId !== agent.id) return false;
+  if (session.roomId && !deps.chat.hasParticipant(session.roomId, 'agent', agent.botName)) return false;
+  return (
+    ownsAgent(agent, cred) || (!!session.roomId && deps.chat.hasParticipant(session.roomId, 'user', senderRef(cred)))
+  );
+}
+
+function sessionScope(agent: AgentRecord, cred: Credential): { participantRef?: string; agentRef: string } {
+  return { agentRef: agent.botName, ...(ownsAgent(agent, cred) ? {} : { participantRef: senderRef(cred) }) };
+}
+
+function titleFromText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().slice(0, 40);
+}
+
+function withDerivedTitle(deps: MessageRouteDeps, session: MessageSession): MessageSession {
+  if (session.title?.trim() || !session.roomId) return session;
+  const title = titleFromText(deps.chat.firstMessageContent(session.roomId) || '');
+  return title ? (deps.messages.setSessionTitle(session.id, title) ?? session) : session;
+}
+
+function pageNumber(value: string | null, fallback: number, max: number): number {
+  const parsed = Number(value ?? fallback);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(fallback === 0 ? 0 : 1, Math.floor(parsed))) : fallback;
 }
 
 function isFeishuChatId(value: string): boolean {
@@ -84,8 +125,7 @@ export function registerSession(deps: MessageRouteDeps, body: Record<string, unk
   const ref = typeof body.agentId === 'string' ? body.agentId.trim() : '';
   const agent = resolveAgent(deps.agents, ref || cred.botName, cred);
   if (!agent) return err(404, 'agent_not_found');
-  if (cred.role !== 'admin' && agent.ownerCredentialId !== cred.id && agent.ownerName !== cred.ownerName)
-    return err(403, 'session_ownership_required');
+  if (!ownsAgent(agent, cred)) return err(403, 'session_ownership_required');
   if (
     body.status !== undefined &&
     (typeof body.status !== 'string' || !['online', 'resumable', 'offline', 'provisioning'].includes(body.status))
@@ -93,6 +133,11 @@ export function registerSession(deps: MessageRouteDeps, body: Record<string, unk
     return err(400, 'invalid_session_status');
   }
   const roomId = typeof body.roomId === 'string' ? body.roomId.trim() : '';
+  if (roomId && !deps.chat.hasParticipant(roomId, 'agent', agent.botName)) return err(403, 'session_room_forbidden');
+  const requestedId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+  const existing = requestedId ? deps.messages.getSession(requestedId) : null;
+  if (existing && existing.agentId !== agent.id) return err(409, 'session_agent_mismatch');
+  if (existing?.roomId && roomId && existing.roomId !== roomId) return err(409, 'session_room_mismatch');
   // Bind a provider session back to the central logical session that created
   // this room. The Bridge's local SessionRegistry UUID is not a Bus address.
   const roomSession = roomId ? deps.messages.findSessionByRoom(agent.id, roomId) : null;
@@ -119,19 +164,55 @@ export function listSessions(
 ): RouteResult {
   const agent = resolveAgent(deps.agents, agentRef, cred);
   if (!agent) return err(404, 'agent_not_found');
-  const limit = Math.max(1, Math.min(100, Number(query.get('limit') || 20) || 20));
-  const offset = Math.max(0, Number(query.get('offset') || 0) || 0);
-  const result = deps.messages.listSessions(agent.id, { limit, offset });
+  const limit = pageNumber(query.get('limit'), 20, 100);
+  const offset = pageNumber(query.get('offset'), 0, Number.MAX_SAFE_INTEGER);
+  const result = deps.messages.listSessions(agent.id, { limit, offset, ...sessionScope(agent, cred) });
   return {
     status: 200,
     body: {
       agentId: agent.id,
       agentName: agent.botName,
       ...result,
+      sessions: result.sessions.map((session) => withDerivedTitle(deps, session)),
       limit,
       offset,
       hasMore: offset + result.sessions.length < result.total,
       nextOffset: offset + result.sessions.length < result.total ? offset + result.sessions.length : null,
+    },
+  };
+}
+
+export function listSessionMessages(
+  deps: MessageRouteDeps,
+  sessionId: string,
+  query: URLSearchParams,
+  cred: Credential,
+): RouteResult {
+  const session = deps.messages.getSession(sessionId.trim());
+  if (!session) return err(404, 'session_not_found');
+  const agent = deps.agents.getById(session.agentId);
+  if (!agent || !resolveAgent(deps.agents, agent.botName, cred) || !canAccessSession(deps, session, agent, cred))
+    return err(404, 'session_not_found');
+  const limit = pageNumber(query.get('limit'), 20, 200);
+  const before = query.get('before')?.trim() || undefined;
+  const messages = session.roomId ? deps.chat.peekMessages(session.roomId, { limit, before }) : [];
+  const hasMore =
+    !!session.roomId &&
+    messages.length === limit &&
+    deps.chat.peekMessages(session.roomId, { limit: 1, before: messages[0]!.id }).length > 0;
+  return {
+    status: 200,
+    body: {
+      sessionId: session.id,
+      agentId: agent.id,
+      agentName: agent.botName,
+      roomId: session.roomId ?? null,
+      sessionStatus: session.status,
+      sessionTitle: withDerivedTitle(deps, session).title ?? null,
+      messages,
+      limit,
+      hasMore,
+      oldestMessageId: messages[0]?.id ?? null,
     },
   };
 }
@@ -144,31 +225,56 @@ export function sendMessage(deps: MessageRouteDeps, body: Record<string, unknown
   if (!text) return err(400, 'message_required');
   const agent = resolveAgent(deps.agents, ref, cred);
   if (!agent) return err(404, 'agent_not_found');
+  const senderSessionId = typeof body.senderSessionId === 'string' ? body.senderSessionId.trim() : '';
+  if (senderSessionId) {
+    const senderSession = deps.messages.getSession(senderSessionId);
+    const senderAgent = senderSession && deps.agents.getById(senderSession.agentId);
+    if (
+      !senderSession ||
+      !senderAgent ||
+      !ownsAgent(senderAgent, cred) ||
+      (senderAgent.ownerName || senderAgent.botName).toLowerCase() !== senderRef(cred) ||
+      !canAccessSession(deps, senderSession, senderAgent, cred) ||
+      (senderSession.roomId && !deps.chat.hasParticipant(senderSession.roomId, 'user', senderRef(cred)))
+    )
+      return err(403, 'sender_session_ownership_required');
+  }
   const requested = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
   let session = requested ? deps.messages.getSession(requested) : null;
   if (requested && (!session || session.agentId !== agent.id)) return err(404, 'session_not_found');
+  if (session && !canAccessSession(deps, session, agent, cred)) return err(404, 'session_not_found');
   if (session?.status === 'offline') {
     return err(409, 'session_offline', { sessions: [session], agentId: agent.id, agentName: agent.botName });
   }
   if (!session) {
     // Filter before applying the result cap so old resumable sessions cannot
     // be hidden by a burst of newer offline sessions.
-    const usable = deps.messages.listSessions(agent.id, { limit: 100, statuses: ['online', 'resumable'] });
+    const scope = sessionScope(agent, cred);
+    const usable = deps.messages.listSessions(agent.id, { limit: 100, statuses: ['online', 'resumable'], ...scope });
     if (usable.total > 1)
       return err(409, 'session_required', { sessions: usable.sessions, agentId: agent.id, agentName: agent.botName });
     if (usable.total === 1) session = usable.sessions[0]!;
     else {
-      const pending = deps.messages.listSessions(agent.id, { limit: 100, statuses: ['provisioning'] });
+      const pending = deps.messages.listSessions(agent.id, { limit: 100, statuses: ['provisioning'], ...scope });
       if (pending.total > 1)
-        return err(409, 'session_provisioning', { sessions: pending.sessions, agentId: agent.id, agentName: agent.botName });
+        return err(409, 'session_provisioning', {
+          sessions: pending.sessions,
+          agentId: agent.id,
+          agentName: agent.botName,
+        });
       if (pending.total === 1) session = pending.sessions[0]!;
       else {
-        const listed = deps.messages.listSessions(agent.id, { limit: 100 });
+        const listed = deps.messages.listSessions(agent.id, { limit: 100, ...scope });
         if (listed.total > 0)
-          return err(409, 'session_offline', { sessions: listed.sessions, agentId: agent.id, agentName: agent.botName });
+          return err(409, 'session_offline', {
+            sessions: listed.sessions,
+            agentId: agent.id,
+            agentName: agent.botName,
+          });
       }
     }
   }
+  if (session && !canAccessSession(deps, session, agent, cred)) return err(404, 'session_not_found');
   const from = senderRef(cred);
   const idempotencyKey = typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim() : '';
   if (!session) {
@@ -183,6 +289,7 @@ export function sendMessage(deps: MessageRouteDeps, body: Record<string, unknown
       agentName: agent.botName,
       status: 'provisioning',
       roomId: room.id,
+      title: titleFromText(text),
     });
   } else if (!session.roomId) {
     const room = deps.chat.createConversation({
@@ -196,6 +303,7 @@ export function sendMessage(deps: MessageRouteDeps, body: Record<string, unknown
       agentName: agent.botName,
       id: session.id,
       roomId: room.id,
+      title: session.title || titleFromText(text),
     });
   }
   let presentation: ChatRunPresentation | undefined;
@@ -207,7 +315,7 @@ export function sendMessage(deps: MessageRouteDeps, body: Record<string, unknown
   }
   if (
     !presentation &&
-    body.presentationMode !== 'implicit' &&
+    body.presentationMode === 'child-direct' &&
     session.transportPlatform === 'feishu' &&
     typeof session.transportChatId === 'string' &&
     isFeishuChatId(session.transportChatId)
@@ -241,6 +349,7 @@ export function sendMessage(deps: MessageRouteDeps, body: Record<string, unknown
       };
     }
   }
+  deps.chat.ensureParticipantUnchecked(session.roomId!, { kind: 'user', ref: from });
   const { message, run, idempotentReplay } = deps.chat.appendMessageAndCreateRun(
     {
       conversationId: session.roomId!,
@@ -251,7 +360,7 @@ export function sendMessage(deps: MessageRouteDeps, body: Record<string, unknown
       content: text,
       mentionedAgentRefs: [],
       replyTo: typeof body.replyTo === 'string' ? body.replyTo : undefined,
-      senderSessionId: typeof body.senderSessionId === 'string' ? body.senderSessionId : undefined,
+      senderSessionId: senderSessionId || undefined,
     },
     {
       conversationId: session.roomId!,
@@ -276,34 +385,7 @@ export function sendMessage(deps: MessageRouteDeps, body: Record<string, unknown
       },
     };
   }
-  deps.events.publish({
-    type: 'message.created',
-    roomId: session.roomId,
-    agentRef: agent.botName,
-    messageId: message.id,
-    runId: run.id,
-    correlationId: run.id,
-    payload: { sessionId: session.id },
-  });
-  deps.events.publish({
-    type: 'run.available',
-    roomId: session.roomId,
-    agentRef: agent.botName,
-    messageId: message.id,
-    runId: run.id,
-    correlationId: run.id,
-    payload: { sessionId: session.id },
-  });
-  deps.deliverRun?.({
-    id: run.id,
-    conversationId: session.roomId!,
-    triggerMessageId: message.id,
-    targetAgentRef: agent.botName,
-    prompt: text,
-    engine: run.engine,
-    model: run.model,
-    presentation: run.presentation,
-  });
+  dispatchRun(deps, session, message, run);
   return {
     status: 202,
     body: {
@@ -316,6 +398,123 @@ export function sendMessage(deps: MessageRouteDeps, body: Record<string, unknown
       agentName: agent.botName,
     },
   };
+}
+
+function dispatchRun(
+  deps: MessageRouteDeps,
+  session: MessageSession,
+  message: ChatMessage,
+  run: ChatRun,
+  notification?: 'result' | 'error',
+): void {
+  deps.events.publish({
+    type: 'message.created',
+    roomId: session.roomId,
+    agentRef: run.targetAgentRef,
+    messageId: message.id,
+    runId: run.id,
+    correlationId: run.id,
+    payload: { sessionId: session.id },
+  });
+  deps.events.publish({
+    type: 'run.available',
+    roomId: session.roomId,
+    agentRef: run.targetAgentRef,
+    messageId: message.id,
+    runId: run.id,
+    correlationId: run.id,
+    payload: { sessionId: session.id },
+  });
+  deps.deliverRun?.({
+    id: run.id,
+    conversationId: session.roomId!,
+    triggerMessageId: message.id,
+    targetAgentRef: run.targetAgentRef,
+    prompt: message.content,
+    engine: run.engine,
+    model: run.model,
+    presentation: run.presentation,
+    ...(notification ? { notification } : {}),
+  });
+}
+
+export function deliverRunResultToSenderSession(deps: MessageRouteDeps, run: ChatRun, event: ChatRunEvent): void {
+  if (event.runId !== run.id || (event.kind !== 'complete' && event.kind !== 'error')) return;
+  if (run.presentation?.mode === 'origin-proxy') return;
+  const trigger = deps.chat.getMessage(run.triggerMessageId);
+  if (!trigger?.senderSessionId || trigger.senderKind !== 'user' || trigger.conversationId !== run.conversationId)
+    return;
+  let session = deps.messages.getSession(trigger.senderSessionId);
+  if (!session || session.roomId === run.conversationId) return;
+  const senderAgent = deps.agents.getById(session.agentId);
+  if (!senderAgent || (senderAgent.ownerName || senderAgent.botName).toLowerCase() !== trigger.senderRef) return;
+  if (
+    session.roomId &&
+    (!deps.chat.hasParticipant(session.roomId, 'agent', senderAgent.botName) ||
+      !deps.chat.hasParticipant(session.roomId, 'user', trigger.senderRef))
+  )
+    return;
+  const key = `run-result:${run.id}`;
+  if (deps.chat.getRunByIdempotency(trigger.senderRef, key)) return;
+  const finalMessage = run.finalMessageId ? deps.chat.getMessage(run.finalMessageId) : null;
+  const raw =
+    event.kind === 'error' ? run.error || event.payload.error : finalMessage?.content || event.payload.content;
+  const collapsed = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : '';
+  const excerpt =
+    event.kind === 'error' && typeof raw === 'string'
+      ? raw
+      : collapsed.length > 800
+        ? `${collapsed.slice(0, 800)}…`
+        : collapsed;
+  const text = [
+    `[Agent Bus reply] ${run.targetAgentRef} ${event.kind === 'error' ? 'failed' : 'completed'} your task (run ${run.id}): ${excerpt || '(no text result)'}`,
+    `Read the full run events: curl -H "Authorization: Bearer $METABOT_CORE_TOKEN" "\${METABOT_CORE_URL:-http://127.0.0.1:9200}/api/chat/runs/${run.id}/events"`,
+    'Continue related work if appropriate; no reply is required for unrelated results.',
+  ].join('\n\n');
+  if (!session.roomId) {
+    const room = deps.chat.createConversation({
+      kind: 'dm',
+      title: session.title || senderAgent.botName,
+      createdBy: trigger.senderRef,
+      participants: [{ kind: 'agent', ref: senderAgent.botName }],
+    });
+    session = deps.messages.ensureSession({
+      agentId: senderAgent.id,
+      agentName: senderAgent.botName,
+      id: session.id,
+      roomId: room.id,
+    });
+  }
+  deps.chat.ensureParticipantUnchecked(session.roomId!, { kind: 'user', ref: trigger.senderRef });
+  const presentation: ChatRunPresentation | undefined =
+    session.transportPlatform === 'feishu' && isFeishuChatId(session.transportChatId || '')
+      ? {
+          mode: 'child-direct',
+          chatId: session.transportChatId!,
+          targetAgentRef: senderAgent.botName,
+          requestedBy: run.targetAgentRef,
+        }
+      : undefined;
+  const notice = deps.chat.appendMessageAndCreateRun(
+    {
+      conversationId: session.roomId!,
+      kind: 'system',
+      senderKind: 'user',
+      senderRef: trigger.senderRef,
+      senderDisplayName: run.targetAgentRef,
+      content: text,
+      mentionedAgentRefs: [],
+    },
+    {
+      conversationId: session.roomId!,
+      targetAgentRef: senderAgent.botName,
+      idempotencyOwner: trigger.senderRef,
+      idempotencyKey: key,
+      presentation,
+    },
+  );
+  if (!notice.idempotentReplay)
+    dispatchRun(deps, session, notice.message, notice.run, event.kind === 'error' ? 'error' : 'result');
 }
 
 export function ackMessage(deps: MessageRouteDeps, id: string, cred: Credential): RouteResult {
@@ -369,11 +568,25 @@ export function streamMessages(
   const ref = query.get('agentId') || query.get('agent') || '';
   const agent = resolveAgent(deps.agents, ref, cred);
   if (!agent) return err(404, 'agent_not_found');
-  deps.events.subscribe(
-    req,
-    res,
-    (event) =>
-      event.agentRef === agent.botName &&
-      (!query.get('sessionId') || event.payload?.sessionId === query.get('sessionId')),
-  );
+  const sessionId = query.get('sessionId')?.trim() || '';
+  if (sessionId) {
+    const session = deps.messages.getSession(sessionId);
+    if (!session || session.agentId !== agent.id || !canAccessSession(deps, session, agent, cred))
+      return err(404, 'session_not_found');
+  }
+  deps.events.subscribe(req, res, (event) => {
+    if (event.agentRef !== agent.botName) return false;
+    const session =
+      typeof event.payload?.sessionId === 'string'
+        ? deps.messages.getSession(event.payload.sessionId)
+        : event.roomId
+          ? deps.messages.findSessionByRoom(agent.id, event.roomId)
+          : null;
+    return (
+      !!session &&
+      session.agentId === agent.id &&
+      (!sessionId || session.id === sessionId) &&
+      canAccessSession(deps, session, agent, cred)
+    );
+  });
 }

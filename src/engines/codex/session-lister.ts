@@ -86,6 +86,7 @@ function listCodexSessionsFromStateDb(opts: {
       const preview = row.preview || row.first_user_message || row.title || '';
       return {
         sessionId: row.id,
+        name: row.title?.trim() || undefined,
         preview: truncatePreview(preview, opts.previewMaxLen) || '(no preview)',
         lastActive: (row.updated_at_ms ?? (row.updated_at ?? 0) * 1000) || stat?.mtimeMs || 0,
         sizeBytes: stat?.size ?? 0,
