@@ -664,7 +664,7 @@ async function runCoreChatTask(ctx: RouteContext, request: CoreChatRunRequest, r
         } finally {
           record.execution = 'finished';
         }
-        admission.settle(result.success ? 'success' : 'failure');
+        admission.settle(result.execution === 'not-started' ? 'abandoned' : result.success ? 'success' : 'failure');
       }
 
       if (record.status !== 'running') return;

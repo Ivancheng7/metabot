@@ -118,7 +118,7 @@ export async function handleTaskRoutes(
             admission.settle('failure');
             throw err;
           }
-          admission.settle(result.success ? 'success' : 'failure');
+          admission.settle(result.execution === 'not-started' ? 'abandoned' : result.success ? 'success' : 'failure');
           return result;
         };
         logger.info({ botName, chatId, promptLength: prompt.length, asyncMode }, 'API talk request');
