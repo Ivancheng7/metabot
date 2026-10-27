@@ -60,12 +60,7 @@ export interface BotConfigBase {
   description?: string;
   specialties?: string[];
   icon?: string;
-  /**
-   * Explicit `/model list` catalog for the Claude engine. When omitted the
-   * list is derived from the endpoint's `ANTHROPIC_DEFAULT_*_MODEL` aliases
-   * (settings.json `env` → process env), so it reflects what the proxy
-   * actually routes instead of a hardcoded, drift-prone list.
-   */
+  /** Claude catalog override; otherwise use effective endpoint aliases, then upstream defaults. */
   availableModels?: string[];
   maxConcurrentTasks?: number;
   budgetLimitDaily?: number;
@@ -328,7 +323,6 @@ interface EngineJsonFields {
   engine?: EngineName;
   kimi?: KimiJsonConfig;
   codex?: CodexJsonConfig;
-  /** Explicit `/model list` catalog for the Claude engine. */
   availableModels?: string[];
   /** Claude turn backend: 'pty' (default) or 'sdk' (legacy opt-out). Overrides env CLAUDE_BACKEND. */
   backend?: 'sdk' | 'pty';

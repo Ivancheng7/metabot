@@ -515,7 +515,7 @@ export class CommandHandler {
       }
       lines.push('');
       if (activeEngine === 'claude') {
-        lines.push('_Tip: append `[1m]` to a model id to enable its 1M context window._');
+        lines.push('_Tip: Context limits and model ID suffixes depend on your endpoint._');
       } else if (activeEngine === 'codex') {
         lines.push('_Tip: leave unset to use the Codex CLI default from `~/.codex/config.toml`._');
       } else {
