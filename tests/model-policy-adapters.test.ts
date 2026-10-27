@@ -42,7 +42,7 @@ describe('model policy at external engine boundaries', () => {
     external.query.mockImplementation(() => (async function* () {})());
     const executor = new ClaudeExecutor(config, logger);
     if (mode === 'turn') { const handle = executor.startExecution(options()); handle.finish(); }
-    else for await (const _message of executor.execute(options())) {}
+    else for await (const _message of executor.execute(options())) { void _message; }
     const queryOptions = external.query.mock.calls[0][0].options;
     expect(queryOptions).not.toHaveProperty('model');
     expect(queryOptions).toMatchObject({ maxTurns: 1, allowedTools: [], settingSources: ['user', 'project'] });
@@ -83,7 +83,7 @@ describe('model policy at external engine boundaries', () => {
       steer: vi.fn(), abortSession: vi.fn(), setGoal: vi.fn(), controlGoal: vi.fn(), approve: vi.fn(), respondQuestion: vi.fn(),
     } as unknown as KimiClientLike;
     const executor = new KimiExecutor(config, logger, client);
-    for await (const _message of executor.execute(options())) {}
+    for await (const _message of executor.execute(options())) { void _message; }
     expect(client.resolveModel).toHaveBeenCalledWith(undefined);
     expect(client.openSession).toHaveBeenCalledWith(process.cwd(), undefined, 'native-kimi');
     expect(client.submitPrompt).toHaveBeenCalledWith('session', 'work', expect.objectContaining({ model: 'native-kimi' }));
